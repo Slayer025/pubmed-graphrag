@@ -12,7 +12,7 @@ This project builds a **GraphRAG** pipeline over PubMed scientific abstracts. Th
 - **Evaluation** — measure retrieval quality and answer faithfulness
 - **Demo application** — interactive query interface over the graph
 
-**Phase 1 (complete)** covers data loading, chunking, embedding, and visualization. Neo4j, retrieval, and generation are planned for later phases.
+**Phase 1 (complete)** covers data loading, chunking, embedding, and visualization. **Phase 2 (complete)** covers entity extraction and Neo4j-importable graph export. Retrieval and generation are planned for later phases.
 
 ## Environment
 
@@ -104,6 +104,44 @@ Model: `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions).
 
 Uses UMAP when available; falls back to t-SNE. Subsamples to 10 000 points for memory efficiency.
 
+### `src/graph_schema.py`
+
+| | |
+|---|---|
+| **Purpose** | Define Neo4j node/relationship schema and generate import Cypher |
+| **Input** | None (schema constants) |
+| **Output** | `GraphSchema` object; `data/graph/schema.cypher` |
+
+Schema: `:Article {article_id, abstract}`, `:Chunk {chunk_id, article_id, text, strategy, embedding}`, `:Entity {entity_id, name, label}`; relationships `:HAS_CHUNK` (Article → Chunk) and `:MENTIONS` (Chunk → Entity).
+
+### `src/entity_extraction.py`
+
+| | |
+|---|---|
+| **Purpose** | Extract named entities and noun phrases from semantic chunks |
+| **Input** | `data/chunks/chunks_semantic.jsonl.gz` |
+| **Output** | `data/graph/entities.jsonl.gz` |
+
+Uses spaCy `en_core_web_sm` (~13 MB); falls back to a lightweight regex extractor if spaCy is unavailable.
+
+### `src/graph_loader.py`
+
+| | |
+|---|---|
+| **Purpose** | Build Article / Chunk / Entity nodes and HAS_CHUNK / MENTIONS edges as CSVs |
+| **Input** | Semantic chunks, embeddings, source abstracts, and extracted entity mentions |
+| **Output** | `data/graph/*.csv` and `data/graph/schema.cypher` |
+
+Estimates output size before writing; aborts if estimate exceeds 1 GB.
+
+### `src/create_graph.py`
+
+| | |
+|---|---|
+| **Purpose** | Orchestrate Phase 2: entity extraction + graph CSV export |
+| **Input** | Phase 1 artifacts |
+| **Output** | All files under `data/graph/` |
+
 ### `src/storage.py`
 
 Shared disk-budget utilities: gzip I/O, HF cache configuration, cleanup helpers, size estimation and 1 GB warnings (disk02 policy).
@@ -118,6 +156,13 @@ Shared disk-budget utilities: gzip I/O, HF cache configuration, cleanup helpers,
 | `data/chunks/chunks_semantic.jsonl.gz` | 2.2 MB | 15 556 semantic chunks |
 | `data/embeddings/semantic_embeddings.npy` | 23 MB | Shape `(15556, 384)` |
 | `outputs/semantic_clusters.png` | 712 KB | 2-D embedding visualization |
+| `data/graph/entities.jsonl.gz` | 407 KB | Entity mentions per semantic chunk |
+| `data/graph/articles.csv` | 5.9 MB | 5 000 Article nodes |
+| `data/graph/chunks.csv` | 60.5 MB | 15 556 Chunk nodes with embeddings |
+| `data/graph/entities.csv` | 7.5 MB | 137 219 deduplicated Entity nodes |
+| `data/graph/has_chunk.csv` | 373 KB | 15 556 Article → Chunk edges |
+| `data/graph/mentions.csv` | 10.6 MB | 258 464 Chunk → Entity edges |
+| `data/graph/schema.cypher` | 1.8 KB | Neo4j constraints, indexes, and `LOAD CSV` script |
 
 ## Phase Progress
 
@@ -141,7 +186,12 @@ Shared disk-budget utilities: gzip I/O, HF cache configuration, cleanup helpers,
 
 ### Phase 2 — Neo4j graph construction
 
-**Status:** Not started
+**Status:** Complete
+
+- [x] Define graph schema (`graph_schema.py`)
+- [x] Extract entities from semantic chunks (`entity_extraction.py`)
+- [x] Build Neo4j-importable node/edge CSVs (`graph_loader.py`)
+- [x] Orchestrate Phase 2 (`create_graph.py`)
 
 ### Phase 3 — Retrieval
 
@@ -176,18 +226,29 @@ python -m src.embeddings
 
 # Step 4: Visualize embeddings
 python -m src.visualize_chunks
+
+# Step 5: Build Neo4j-importable graph (Phase 2)
+python -m src.create_graph
 ```
+
+## Phase 2 import (after Neo4j is running)
+
+Copy `data/graph/*.csv` and `data/graph/schema.cypher` to your Neo4j import directory, then run the Cypher script in Neo4j Browser or `cypher-shell`:
+
+```cypher
+:source schema.cypher
+```
+
+No Neo4j server is required to generate the CSV files — `create_graph.py` produces import-ready artifacts offline.
 
 ## Next Steps
 
-1. **Neo4j setup** — Docker or local instance; define connection config
-2. **Entity extraction** — NER / relation extraction over semantic chunks
-3. **Neo4j loader** — ingest chunks, entities, and edges
-4. **Vector index** — attach embeddings to Neo4j nodes or external index
-5. **Graph-enhanced retrieval** — hybrid vector + graph traversal
-6. **LLM integration** — grounded answer generation
-7. **Evaluation** — retrieval metrics, faithfulness benchmarks
-8. **Demo** — query UI over the graph
+1. **Neo4j setup** — Docker or local instance; load `data/graph/*.csv` with `schema.cypher`
+2. **Vector index** — create a Neo4j vector index over `Chunk.embedding` (or keep an external FAISS/Annoy index)
+3. **Graph-enhanced retrieval** — hybrid vector + graph traversal
+4. **LLM integration** — grounded answer generation
+5. **Evaluation** — retrieval metrics, faithfulness benchmarks
+6. **Demo** — query UI over the graph
 
 ## Constraints
 
@@ -200,7 +261,7 @@ python -m src.visualize_chunks
 
 ## Handoff Notes
 
-**Current state:** Phase 1 is complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, and a cluster visualization.
+**Current state:** Phase 1 and Phase 2 are complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, a cluster visualization, and a Neo4j-importable graph export (137k entities, 258k mentions) generated offline.
 
 **Completed source files:**
 
@@ -210,9 +271,13 @@ python -m src.visualize_chunks
 - `src/embeddings.py` — semantic embedding encoder
 - `src/visualize_chunks.py` — 2-D embedding plot
 - `src/storage.py` — disk-budget and I/O helpers
+- `src/graph_schema.py` — Neo4j graph schema and Cypher generator
+- `src/entity_extraction.py` — spaCy NER + noun-phrase entity extractor
+- `src/graph_loader.py` — Neo4j CSV node/relationship exporter
+- `src/create_graph.py` — Phase 2 orchestrator
 
 **Generated artifacts:** See [Data Artifacts](#data-artifacts) above.
 
-**Next implementation target:** Phase 2 — Neo4j setup, entity extraction, and graph loader. Start by defining a graph schema (Document → Chunk → Entity nodes) and a loader that reads `data/chunks/chunks_semantic.jsonl.gz` plus `data/embeddings/semantic_embeddings.npy`.
+**Next implementation target:** Phase 3 — Retrieval. Start by loading the Phase 2 CSV files into a running Neo4j instance, create a vector index on `Chunk.embedding`, and implement a hybrid retriever that combines vector similarity with graph traversal (e.g., expand retrieved chunks via `MENTIONS` to related entities and co-mentioned chunks).
 
-**Do not yet:** start Neo4j in this phase unless explicitly requested; retrieval, evaluation, and demo are out of scope until the graph exists.
+**Do not yet:** start Neo4j in this phase unless explicitly requested; retrieval, evaluation, and demo are out of scope until the graph is loaded into a database.
