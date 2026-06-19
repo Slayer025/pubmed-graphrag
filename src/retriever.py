@@ -201,22 +201,26 @@ class Retriever:
             self._model = create_embedding_model(self.config.embedding.model_name)
         return self._model
 
-    def embed_query(self, query: str) -> np.ndarray:
-        """Embed and normalize a query string."""
+    def embed_queries(self, queries: list[str]) -> np.ndarray:
+        """Embed and normalize a batch of query strings."""
         model = self._get_model()
-        logger.info("Embedding query (len=%d)", len(query))
+        logger.info("Embedding %d queries (total chars=%d)", len(queries), sum(len(q) for q in queries))
         t0 = time.perf_counter()
-        vector = model.encode(
-            [query],
-            batch_size=1,
+        vectors = model.encode(
+            queries,
+            batch_size=self.config.embedding.batch_size,
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        logger.info("Query embedded in %.2f seconds", time.perf_counter() - t0)
-        vector = np.asarray(vector, dtype=np.float32)
+        logger.info("Queries embedded in %.2f seconds", time.perf_counter() - t0)
+        vectors = np.asarray(vectors, dtype=np.float32)
         if self.config.embedding.normalize:
-            vector = normalize_embeddings(vector)
-        return vector[0]
+            vectors = normalize_embeddings(vectors)
+        return vectors
+
+    def embed_query(self, query: str) -> np.ndarray:
+        """Embed and normalize a query string."""
+        return self.embed_queries([query])[0]
 
     def vector_search(self, query_vector: np.ndarray, top_k: int | None = None) -> list[tuple[str, float]]:
         """Return top-k (chunk_id, cosine_similarity) by dot product."""

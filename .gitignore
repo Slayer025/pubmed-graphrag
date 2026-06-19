@@ -1,8 +1,19 @@
 .venv/
+.env/
 
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.DS_Store
+Thumbs.db
+
+*.log
 
 data/
 outputs/
@@ -17,6 +28,8 @@ pip_cache_backup/
 *.pt
 *.bin
 *.safetensors
+*.ckpt
+*.pth
 
 .ipynb_checkpoints/
 .cursor/
@@ -25,4 +38,3 @@ pip_cache_backup/
 
 build/
 dist/
-*.egg-info/

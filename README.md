@@ -142,6 +142,58 @@ Estimates output size before writing; aborts if estimate exceeds 1 GB.
 | **Input** | Phase 1 artifacts |
 | **Output** | All files under `data/graph/` |
 
+### `src/llm_client.py`
+
+| | |
+|---|---|
+| **Purpose** | Real LLM generation backends that implement the `LLMClient` protocol |
+| **Input** | Prompt string; environment variables (`OPENAI_API_KEY`, `LLM_MODEL`, `OLLAMA_URL`) |
+| **Output** | Generated answer text |
+
+Supports `OpenAIClient` (OpenAI-compatible chat completions), `OllamaClient` (local Ollama `/api/generate`), and re-exports `MockLLMClient` for testing.
+
+### `src/evaluation.py`
+
+| | |
+|---|---|
+| **Purpose** | Retrieval evaluation metrics and vector-only vs GraphRAG comparison |
+| **Input** | PubMedQA questions with matched article IDs; `Retriever` instance |
+| **Output** | `RetrievalMetrics`, per-question results, `outputs/retrieval_results.csv`, `outputs/retrieval_summary.json` |
+
+Metrics: Recall@5, Recall@10, MRR. Compares vector-only baseline (`expand_depth=0, alpha=1.0`) against default GraphRAG (`expand_depth=2, alpha=0.8`).
+
+### `src/generation_eval.py`
+
+| | |
+|---|---|
+| **Purpose** | Generation quality metrics |
+| **Input** | Generated answers and PubMedQA reference long answers |
+| **Output** | ROUGE-L and BERTScore (precision/recall/F1) per question |
+
+### `src/eval_dataset.py`
+
+| | |
+|---|---|
+| **Purpose** | Build the Phase 4 evaluation dataset from PubMedQA |
+| **Input** | PubMedQA `pqa_labeled` split (via HuggingFace or raw JSON fallback); our 5,000 abstract subset |
+| **Output** | `data/evaluation/pubmedqa_filtered.jsonl.gz` |
+
+### `scripts/run_evaluation.py`
+
+| | |
+|---|---|
+| **Purpose** | End-to-end Phase 4 evaluation runner |
+| **Input** | Evaluation questions and pre-computed query embeddings |
+| **Output** | `outputs/retrieval_results.csv`, `outputs/retrieval_summary.json`, `outputs/generation_results.csv`, `outputs/evaluation_summary.json` |
+
+CLI: `--max-questions`, `--retrieval-only`, `--llm-client {mock,openai,ollama}`, `--use-llm`.
+
+### `notebooks/phase4_evaluation.ipynb`
+
+| | |
+|---|---|
+| **Purpose** | Interactive summary of dataset statistics, retrieval comparison, and generation metrics |
+
 ### `src/storage.py`
 
 Shared disk-budget utilities: gzip I/O, HF cache configuration, cleanup helpers, size estimation and 1 GB warnings (disk02 policy).
@@ -245,7 +297,17 @@ Notes:
 
 ### Phase 4 — LLM generation & evaluation
 
-**Status:** Not started
+**Status:** Complete
+
+- [x] PubMedQA evaluation dataset pipeline (`src/eval_dataset.py`)
+- [x] Filter PubMedQA questions to our 5,000 abstract subset (`data/evaluation/pubmedqa_filtered.jsonl.gz`)
+- [x] Text-similarity matching between PubMedQA contexts and our abstracts
+- [x] Retrieval metrics: Recall@5, Recall@10, MRR (`src/evaluation.py`)
+- [x] Vector-only vs GraphRAG retrieval comparison (`outputs/retrieval_comparison.csv`)
+- [x] Real LLM clients: OpenAI-compatible and Ollama (`src/llm_client.py`)
+- [x] Generation metrics: ROUGE-L and BERTScore (`src/generation_eval.py`)
+- [x] End-to-end Phase 4 runner (`scripts/run_evaluation.py`)
+- [x] Evaluation notebook (`notebooks/phase4_evaluation.ipynb`)
 
 ### Phase 5 — Demo application
 
@@ -393,6 +455,50 @@ python scripts/retrieval_debug.py "diabetes prevention" \
   --max-results 15
 ```
 
+Run the Phase 4 evaluation (retrieval only, fast smoke test):
+
+```bash
+python scripts/run_evaluation.py --max-questions 10 --retrieval-only
+```
+
+Run the full Phase 4 evaluation with mock generation:
+
+```bash
+python scripts/run_evaluation.py --max-questions 50 --llm-client mock
+```
+
+Run with a real OpenAI-compatible model:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export LLM_MODEL=gpt-3.5-turbo
+python scripts/run_evaluation.py --max-questions 50 --llm-client openai
+```
+
+Run with a local Ollama model:
+
+```bash
+export LLM_MODEL=llama3
+export OLLAMA_URL=http://localhost:11434
+python scripts/run_evaluation.py --max-questions 50 --llm-client ollama
+```
+
+Build or refresh the evaluation dataset:
+
+```bash
+python -m src.eval_dataset
+```
+
+Pre-compute query embeddings (slow once, reused by the runner):
+
+```bash
+python -c "
+from src.evaluation import load_questions, precompute_query_embeddings
+q = load_questions('data/evaluation/pubmedqa_filtered.jsonl.gz')
+precompute_query_embeddings(q)
+"
+```
+
 ## Phase 2 import (after Neo4j is running)
 
 Copy `data/graph/*.csv` and `data/graph/schema.cypher` to your Neo4j import directory, then run the Cypher script in Neo4j Browser or `cypher-shell`:
@@ -431,7 +537,7 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 
 ## Handoff Notes
 
-**Current state:** Phase 1, Phase 2, and Phase 3 are complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, a cluster visualization, a Neo4j-importable graph export (137k entities, 258k mentions) generated offline, and an offline graph-enhanced retriever.
+**Current state:** Phases 0–4 are complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, a cluster visualization, a Neo4j-importable graph export (137k entities, 258k mentions) generated offline, an offline graph-enhanced retriever, and a full Phase 4 evaluation harness over PubMedQA.
 
 **Completed source files:**
 
@@ -449,13 +555,26 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 - `src/retriever.py` — graph-enhanced retriever
 - `src/rag_pipeline.py` — RAG pipeline scaffold with mock generation
 - `scripts/retrieval_debug.py` — manual retrieval test
+- `src/eval_dataset.py` — PubMedQA evaluation dataset builder
+- `src/evaluation.py` — retrieval metrics and comparison
+- `src/llm_client.py` — OpenAI / Ollama / mock LLM clients
+- `src/generation_eval.py` — ROUGE-L and BERTScore evaluation
+- `scripts/run_evaluation.py` — end-to-end Phase 4 runner
+- `notebooks/phase4_evaluation.ipynb` — evaluation summary notebook
 
-**Generated artifacts:** See [Data Artifacts](#data-artifacts) above.
+**Generated artifacts:** See [Data Artifacts](#data-artifacts) above, plus:
 
-**Next implementation target:** Phase 4 — real LLM generation and evaluation. Consider:
-1. Adding an OpenAI/Ollama `LLMClient` implementation.
-2. Creating a small evaluation set of PubMed QA pairs.
-3. Measuring retrieval metrics (MRR, nDCG, recall@k) and answer faithfulness.
-4. Optionally loading the CSV files into Neo4j and switching the retriever to Cypher-based expansion.
+- `data/evaluation/pubmedqa_filtered.jsonl.gz` — filtered PubMedQA questions
+- `data/evaluation/query_embeddings.npy` — cached query embeddings
+- `data/evaluation/query_index.json` — query-to-row mapping
+- `outputs/retrieval_results.csv` — per-question retrieval results
+- `outputs/retrieval_summary.json` — aggregated retrieval metrics
+- `outputs/generation_results.csv` — per-question generation metrics
+- `outputs/evaluation_summary.json` — combined retrieval + generation summary
+
+**Next implementation target:** Phase 5 — interactive demo application. Consider:
+1. A lightweight web UI (Streamlit/Gradio/FastAPI) over the RAG pipeline.
+2. Optional Neo4j-backed retrieval mode.
+3. User-facing explanation of graph expansion evidence.
 
 **Do not yet:** redesign the retrieval architecture, add SEMANTIC_SIMILAR edges, or migrate entity extraction to SciSpaCy unless explicitly requested.
