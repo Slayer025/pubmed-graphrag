@@ -22,7 +22,8 @@ from typing import Any
 import numpy as np
 
 from src.config import AppConfig, RetrievalConfig
-from src.retriever import Retriever, RetrievalResult
+from src.domain.entities.retrieval_result import RetrievalResult
+from src.retriever import Retriever
 
 logger = logging.getLogger(__name__)
 

@@ -271,7 +271,7 @@ def main() -> int:
     if args.max_questions and query_vectors.shape[0] > len(questions):
         query_vectors = query_vectors[: len(questions)]
 
-    # Initialize retriever.
+    # Initialize retriever (deprecated but kept for backward compatibility).
     graph_config = base_config
     graph_retriever = create_retriever(graph_config)
     vector_config = build_vector_only_config(graph_config)

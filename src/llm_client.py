@@ -18,11 +18,24 @@ import logging
 import os
 from typing import Any
 
-from src.rag_pipeline import LLMClient, MockLLMClient
+from src.application.ports import LLMClient
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["LLMClient", "MockLLMClient", "OpenAIClient", "OllamaClient", "create_llm_client"]
+
+
+class MockLLMClient:
+    """Placeholder LLM that echoes the prompt context."""
+
+    def __init__(self, max_chars: int = 500) -> None:
+        self.max_chars = max_chars
+
+    def complete(self, prompt: str, **kwargs: Any) -> str:
+        return (
+            "[MOCK LLM] I would answer based on the retrieved context.\n\n"
+            f"Prompt preview:\n{prompt[:self.max_chars]}..."
+        )
 
 
 class OpenAIClient:

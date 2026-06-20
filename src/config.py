@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.application.dto.rerank_config import RerankConfig
+
 
 @dataclass(frozen=True)
 class Neo4jConfig:
@@ -76,13 +78,7 @@ class RetrievalConfig:
     max_results: int = 20
 
 
-@dataclass(frozen=True)
-class RerankConfig:
-    """Optional graph re-ranking configuration."""
-
-    enabled: bool = False
-    beta: float = 0.7
-    use_pagerank: bool = False
+from src.application.dto.rerank_config import RerankConfig  # noqa: F401  # compatibility re-export
 
 
 @dataclass(frozen=True)

@@ -1,19 +1,7 @@
-"""Graph-aware re-ranking for retrieved PubMed chunks.
+"""Graph-signal re-ranking application service.
 
-The reranker operates on the ``list[RetrievalResult]`` produced by
-``src.retriever`` and boosts results using graph-derived signals.  It never
-modifies the retriever itself.
-
-Signals used (offline primary):
-    * shared entity count with other retrieved chunks
-    * number of retrieved chunks connected via shared entities or same article
-    * inverse entity degree (rarer entities are more discriminative)
-    * optional query/entity text overlap as a secondary feature
-
-Optional enhancement:
-    * If a Neo4j instance with the Graph Data Science (GDS) library is
-      available and enabled in ``AppConfig.neo4j``, PageRank or degree
-      centrality scores are fetched and blended into the ranking.
+Operates on a ``list[RetrievalResult]`` produced by retrieval and boosts results
+using graph-derived signals.  This module contains no IO and no framework code.
 """
 
 from __future__ import annotations
@@ -21,15 +9,15 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from src.retriever import RetrievalResult
+from src.application.dto.rerank_config import RerankConfig
+from src.domain.entities.retrieval_result import RetrievalResult
 
 if TYPE_CHECKING:
-    from src.config import AppConfig
-    from src.retriever import ArtifactIndex
+    from src.application.ports import GraphRepository
 
 logger = logging.getLogger(__name__)
 
@@ -43,43 +31,28 @@ class GraphSignal:
     connected_chunk_count: float
     inverse_degree_score: float
     query_overlap_score: float
-    pagerank_score: float = 0.0
 
     @property
     def primary_score(self) -> float:
         """Aggregate graph connectivity signal in [0, 1]."""
-        # Weighted combination of connectivity heuristics.
         return (
             0.40 * self.shared_entity_count
             + 0.35 * self.connected_chunk_count
             + 0.20 * self.inverse_degree_score
             + 0.05 * self.query_overlap_score
-            + 0.00 * self.pagerank_score
         )
 
 
-@dataclass(frozen=True)
-class RerankConfig:
-    """Configuration for the graph reranker."""
-
-    enabled: bool = False
-    beta: float = 0.7
-    use_pagerank: bool = False
-
-
 class GraphReranker:
-    """Re-rank retrieval results using offline graph signals and optional GDS."""
+    """Re-rank retrieval results using offline graph signals."""
 
     def __init__(
         self,
-        index: ArtifactIndex,
+        index: GraphRepository,
         config: RerankConfig | None = None,
-        app_config: AppConfig | None = None,
     ) -> None:
         self.index = index
         self.config = config or RerankConfig()
-        self.app_config = app_config
-        self._pagerank: dict[str, float] | None = None
 
     def rerank(
         self,
@@ -100,10 +73,6 @@ class GraphReranker:
 
         signals = self._compute_signals(results, result_chunk_ids, query_entities)
         signals = self._normalize_signals(signals)
-
-        if self.config.use_pagerank:
-            signals = self._blend_pagerank(signals)
-
         return self._combine_scores(results, signals)
 
     def _compute_signals(
@@ -112,53 +81,67 @@ class GraphReranker:
         result_chunk_ids: set[str],
         query_entities: set[str],
     ) -> dict[str, GraphSignal]:
-        """Compute raw graph signals for every result chunk."""
+        """Compute raw graph signals for every result chunk.
+
+        Complexity:
+            Let n = number of results, E = total entity mentions across results.
+            This implementation builds an entity->result adjacency map in O(E)
+            and then computes shared-entity counts in O(E) rather than O(n²).
+        """
         signals: dict[str, GraphSignal] = {}
+
+        # Build entity -> set of result chunks containing it.
+        entity_to_results: dict[str, set[str]] = {}
+        for result in results:
+            for entity_id in self.index.get_chunk_entities(result.chunk_id):
+                entity_to_results.setdefault(entity_id, set()).add(result.chunk_id)
+
+        # Filter to entities that appear in at least two results.
+        shared_entities = {
+            entity_id: chunks
+            for entity_id, chunks in entity_to_results.items()
+            if len(chunks) > 1
+        }
 
         for result in results:
             chunk_id = result.chunk_id
-            chunk_entities = self.index.chunk_entities.get(chunk_id, set())
+            chunk_entities = self.index.get_chunk_entities(chunk_id)
 
             shared_entity_count = 0
             connected_chunks: set[str] = set()
 
-            # Connectivity within the retrieved set.
-            for other_id in result_chunk_ids:
-                if other_id == chunk_id:
+            # Count shared entities and connected chunks using adjacency map.
+            for entity_id in chunk_entities:
+                cooccurring = shared_entities.get(entity_id)
+                if not cooccurring:
                     continue
-                other_entities = self.index.chunk_entities.get(other_id, set())
-                overlap = len(chunk_entities & other_entities)
-                if overlap:
-                    shared_entity_count += overlap
+                for other_id in cooccurring:
+                    if other_id == chunk_id:
+                        continue
                     connected_chunks.add(other_id)
+                    shared_entity_count += 1
 
-            # Same-article connections within the retrieved set.
-            article_id = result.article_id
+            # Same-article connections.
+            article_id = self.index.get_chunk_article(chunk_id)
             if article_id:
-                same_article_chunks = self.index.article_chunks.get(article_id, set())
+                same_article_chunks = self.index.get_article_chunks(article_id)
                 for other_id in same_article_chunks & result_chunk_ids:
                     if other_id != chunk_id:
                         connected_chunks.add(other_id)
 
-            # Inverse entity degree: rarer entities contribute more.
             inverse_degree_score = 0.0
             if chunk_entities:
                 degrees = [
-                    self.index.entity_degrees.get(entity_id, 1)
+                    self.index.get_entity_degree(entity_id)
                     for entity_id in chunk_entities
                 ]
-                # Sum of 1/degree, normalized by entity count.
                 inverse_degree_score = sum(1.0 / max(degree, 1) for degree in degrees) / len(
                     chunk_entities
                 )
 
-            # Secondary query overlap using exact entity text match.
             query_overlap_score = 0.0
             if query_entities and chunk_entities:
-                # Map entity ids to canonical lowercase names.
-                chunk_entity_names = {
-                    self._entity_name(entity_id).lower() for entity_id in chunk_entities
-                }
+                chunk_entity_names = {entity_id.lower() for entity_id in chunk_entities}
                 overlap = len(query_entities & chunk_entity_names)
                 query_overlap_score = overlap / len(query_entities)
 
@@ -211,69 +194,6 @@ class GraphReranker:
             return np.zeros_like(values)
         return (values - min_val) / (max_val - min_val)
 
-    def _blend_pagerank(self, signals: dict[str, GraphSignal]) -> dict[str, GraphSignal]:
-        """Blend optional Neo4j GDS PageRank scores into the signals."""
-        pagerank = self._fetch_pagerank()
-        if not pagerank:
-            return signals
-
-        max_pr = max(pagerank.values()) or 1.0
-        blended: dict[str, GraphSignal] = {}
-        for chunk_id, signal in signals.items():
-            pr_score = pagerank.get(chunk_id, 0.0) / max_pr
-            blended[chunk_id] = GraphSignal(
-                chunk_id=chunk_id,
-                shared_entity_count=signal.shared_entity_count,
-                connected_chunk_count=signal.connected_chunk_count,
-                inverse_degree_score=signal.inverse_degree_score,
-                query_overlap_score=signal.query_overlap_score,
-                pagerank_score=float(pr_score),
-            )
-        return blended
-
-    def _fetch_pagerank(self) -> dict[str, float]:
-        """Fetch PageRank scores from Neo4j GDS if available, else empty dict."""
-        if self._pagerank is not None:
-            return self._pagerank
-
-        self._pagerank = {}
-        if self.app_config is None or not self.app_config.neo4j.enabled:
-            return self._pagerank
-
-        try:
-            from neo4j import GraphDatabase
-        except ImportError as exc:
-            logger.warning("Neo4j driver unavailable; skipping PageRank. %s", exc)
-            return self._pagerank
-
-        uri = self.app_config.neo4j.uri
-        auth = (self.app_config.neo4j.user, self.app_config.neo4j.password)
-        database = self.app_config.neo4j.database
-
-        try:
-            driver = GraphDatabase.driver(uri, auth=auth)
-            with driver.session(database=database) as session:
-                # Fast existence check for GDS.
-                gds_check = session.run(
-                    "CALL gds.graph.exists('pubmed-graph') YIELD exists RETURN exists"
-                ).single()
-                if gds_check and gds_check["exists"]:
-                    result = session.run(
-                        "CALL gds.pageRank.stream('pubmed-graph') "
-                        "YIELD nodeId, score RETURN gds.util.asNode(nodeId).chunk_id AS chunk_id, score"
-                    )
-                    for record in result:
-                        chunk_id = record.get("chunk_id")
-                        if chunk_id:
-                            self._pagerank[str(chunk_id)] = float(record["score"])
-                else:
-                    logger.warning("Neo4j GDS graph 'pubmed-graph' not found; skipping PageRank.")
-            driver.close()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to fetch PageRank from Neo4j: %s", exc)
-
-        return self._pagerank
-
     def _combine_scores(
         self,
         results: list[RetrievalResult],
@@ -305,56 +225,15 @@ class GraphReranker:
         return reranked
 
     def _extract_query_entities(self, query: str) -> set[str]:
-        """Extract simple lowercased tokens/terms from the query.
-
-        This is intentionally lightweight.  A full NER pass can be added later.
-        """
+        """Extract simple lowercased tokens/terms from the query."""
         if not query:
             return set()
-        # Drop common stop words and short tokens.
         stop_words = {
-            "a",
-            "an",
-            "the",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "have",
-            "has",
-            "had",
-            "do",
-            "does",
-            "did",
-            "will",
-            "would",
-            "could",
-            "should",
-            "may",
-            "might",
-            "of",
-            "in",
-            "on",
-            "at",
-            "to",
-            "for",
-            "with",
-            "from",
-            "by",
-            "about",
-            "and",
-            "or",
-            "but",
-            "what",
-            "which",
-            "who",
-            "when",
-            "where",
-            "why",
-            "how",
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "of", "in", "on", "at", "to", "for", "with",
+            "from", "by", "about", "and", "or", "but", "what", "which", "who",
+            "when", "where", "why", "how",
         }
         terms = set()
         for token in re.split(r"[^a-zA-Z0-9]+", query.lower()):
@@ -362,19 +241,15 @@ class GraphReranker:
                 terms.add(token)
         return terms
 
-    def _entity_name(self, entity_id: str) -> str:
-        """Best-effort lookup of entity name; falls back to entity_id."""
-        # The ArtifactIndex does not store entity names, so we use the id text.
-        return entity_id
-
 
 def create_graph_reranker(
-    index: ArtifactIndex,
+    index: GraphRepository,
     enabled: bool = False,
     beta: float = 0.7,
     use_pagerank: bool = False,
-    app_config: AppConfig | None = None,
 ) -> GraphReranker:
     """Factory helper for building a graph reranker."""
-    config = RerankConfig(enabled=enabled, beta=beta, use_pagerank=use_pagerank)
-    return GraphReranker(index=index, config=config, app_config=app_config)
+    if use_pagerank:
+        raise NotImplementedError("PageRank reranking is not supported in the clean architecture refactor.")
+    config = RerankConfig(enabled=enabled, beta=beta, use_pagerank=False)
+    return GraphReranker(index=index, config=config)

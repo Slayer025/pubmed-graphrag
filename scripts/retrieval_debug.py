@@ -20,8 +20,9 @@ from pathlib import Path
 import numpy as np
 
 from src.config import AppConfig
-from src.retriever import ArtifactIndex, Retriever, RetrievalResult
+from src.retriever import Retriever, create_retriever
 from src.rag_pipeline import create_rag_pipeline
+from src.domain.entities.retrieval_result import RetrievalResult
 
 
 def _configure_logging(level: int = logging.INFO) -> None:
@@ -129,8 +130,8 @@ def main() -> int:
     # When bypassing the LLM generation interface, build the retriever directly
     # so we can inject a pre-computed query vector.
     if args.query_chunk_id or args.query_vector_file is not None:
-        index = ArtifactIndex.load(config)
-        retriever = Retriever(index, config)
+        retriever = create_retriever(config)
+        index = retriever.index
 
         if args.query_chunk_id:
             row = index.row_by_chunk_id.get(args.query_chunk_id)
@@ -153,7 +154,8 @@ def main() -> int:
         _print_results(query_text, results)
 
         if args.generate:
-            from src.rag_pipeline import RAGPipeline, MockLLMClient
+            from src.llm_client import MockLLMClient
+            from src.rag_pipeline import RAGPipeline
 
             pipeline = RAGPipeline(retriever=retriever, llm=MockLLMClient())
             print("\n" + "=" * 80)
@@ -165,13 +167,15 @@ def main() -> int:
 
     # Standard path: embed the query string and retrieve.
     pipeline = create_rag_pipeline(config)
-    results = pipeline.retrieve(args.query)
+    # create_rag_pipeline now returns a clean-architecture pipeline that requires
+    # an explicit config. Retrieve the default config from the AppConfig.
+    results = pipeline.retrieve(args.query, config.retrieval)
     _print_results(args.query, results)
 
     if args.generate:
         print("\n" + "=" * 80)
         print("Mock generation:\n")
-        response = pipeline.generate(args.query, context=results)
+        response = pipeline.generate(args.query, config.retrieval, context=results)
         print(response.answer)
 
     return 0

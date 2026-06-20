@@ -1,0 +1,183 @@
+"""Bootstrap / Dependency Injection container.
+
+This module owns the object graph construction. It is the ONLY place where
+infrastructure adapters are instantiated and wired into application use cases.
+
+UI layers (Streamlit, CLI, scripts) should call ``bootstrap_pipeline()`` or
+``bootstrap_retriever()`` instead of importing infrastructure directly.
+"""
+
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+from typing import Any
+
+from src.application.dto.rerank_config import RerankConfig
+from src.application.dto.search_config import SearchConfig
+from src.application.ports import LLMClient
+from src.application.use_cases.generate_answer import GenerateAnswerUseCase
+from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
+from src.config import AppConfig
+from src.embeddings import create_embedding_model
+from src.graph_reranker import GraphReranker
+from src.infrastructure.embeddings.sentence_transformer_service import (
+    SentenceTransformerEmbeddingService,
+)
+from src.infrastructure.graph.in_memory_graph_repository import InMemoryGraphRepository
+from src.infrastructure.storage.artifact_loader import ArtifactLoader, LoadedArtifacts
+from src.infrastructure.storage.chunk_repository import InMemoryChunkRepository
+from src.infrastructure.vector_store.numpy_vector_store import NumpyVectorStore
+from src.llm_client import create_llm_client
+from src.query_decomposer import DecomposerConfig, QueryDecomposer
+from src.rag_pipeline import RAGPipeline
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _load_artifacts(config: AppConfig | None = None) -> LoadedArtifacts:
+    """Load Phase 1/2 artifacts exactly once per process."""
+    cfg = config or AppConfig.default()
+    logger.info("Loading artifacts...")
+    return ArtifactLoader.load(cfg)
+
+
+@lru_cache(maxsize=1)
+def _load_embedding_model(config: AppConfig | None = None) -> Any:
+    """Load the sentence-transformers model exactly once per process."""
+    cfg = config or AppConfig.default()
+    logger.info("Loading embedding model...")
+    return create_embedding_model(cfg.embedding.model_name)
+
+
+def _build_embedding_service(config: AppConfig | None = None) -> SentenceTransformerEmbeddingService:
+    """Build the embedding service adapter (lightweight wrapper around cached model)."""
+    cfg = config or AppConfig.default()
+    model = _load_embedding_model(cfg)
+    return SentenceTransformerEmbeddingService(
+        model=model,
+        batch_size=cfg.embedding.batch_size,
+        normalize=cfg.embedding.normalize,
+    )
+
+
+def _build_retrieve_documents(config: AppConfig | None = None) -> RetrieveDocumentsUseCase:
+    """Build the main retrieval use case with cached artifacts and model."""
+    cfg = config or AppConfig.default()
+    artifacts = _load_artifacts(cfg)
+
+    embedding_service = _build_embedding_service(cfg)
+    vector_store = NumpyVectorStore(artifacts.chunks, artifacts.embeddings)
+    graph_repository = InMemoryGraphRepository(
+        artifacts.mentions,
+        artifacts.has_chunk,
+        artifacts.chunks,
+    )
+    chunk_repository = InMemoryChunkRepository(artifacts.chunks)
+
+    return RetrieveDocumentsUseCase(
+        embedding_service=embedding_service,
+        vector_store=vector_store,
+        graph_repository=graph_repository,
+        chunk_repository=chunk_repository,
+    )
+
+
+def _search_config_from_app(config: AppConfig | None = None) -> SearchConfig:
+    """Convert ``AppConfig.retrieval`` into application-layer ``SearchConfig``."""
+    cfg = config or AppConfig.default()
+    return SearchConfig.from_retrieval_config(cfg.retrieval)
+
+
+def bootstrap_retriever(config: AppConfig | None = None) -> "Retriever":
+    """Build the backward-compatible retriever facade.
+
+    This is deprecated; prefer ``bootstrap_pipeline`` for new code.
+    """
+    from src.retriever import Retriever
+
+    cfg = config or AppConfig.default()
+    artifacts = _load_artifacts(cfg)
+
+    # Build a legacy index shape for compatibility.
+    graph_repository = InMemoryGraphRepository(
+        artifacts.mentions,
+        artifacts.has_chunk,
+        artifacts.chunks,
+    )
+    chunk_repository = InMemoryChunkRepository(artifacts.chunks)
+
+    class _Index:
+        def __init__(self, chunks: list[dict[str, Any]], embeddings: Any) -> None:
+            self.chunks = chunks
+            self.embeddings = embeddings
+            self.chunk_by_id = chunk_repository.get_chunks({str(c["chunk_id"]) for c in chunks})
+            self.row_by_chunk_id = {
+                str(chunk["chunk_id"]): row for row, chunk in enumerate(chunks)
+            }
+            self.article_chunks = graph_repository.article_chunks
+            self.entity_chunks = graph_repository.entity_chunks
+            self.chunk_entities = graph_repository.chunk_entities
+            self.entity_degrees = graph_repository.entity_degrees
+
+    index = _Index(artifacts.chunks, artifacts.embeddings)
+    return Retriever(index, cfg)
+
+
+def bootstrap_pipeline(
+    config: AppConfig | None = None,
+    llm: LLMClient | None = None,
+    *,
+    llm_client_type: str | None = None,
+    use_decomposer: bool = False,
+    use_reranker: bool = False,
+    reranker_beta: float = 0.7,
+) -> RAGPipeline:
+    """Build the main RAG orchestrator.
+
+    This is the preferred entry point for UI and script layers. If ``llm`` is
+    not provided but ``llm_client_type`` is given, the LLM client is created by
+    the bootstrap container.
+    """
+    if llm is None and llm_client_type:
+        llm = create_llm_client(llm_client_type)
+
+    retrieve_documents = _build_retrieve_documents(config)
+    generate_answer = GenerateAnswerUseCase(llm=llm) if llm else None
+    decomposer = _build_decomposer(llm, use_decomposer) if llm else None
+    reranker = _build_reranker(retrieve_documents, use_reranker, reranker_beta)
+    return RAGPipeline(
+        retrieve_documents=retrieve_documents,
+        generate_answer=generate_answer,
+        llm=llm,
+        decomposer=decomposer,
+        reranker=reranker,
+    )
+
+
+def _build_decomposer(
+    llm: LLMClient,
+    enabled: bool = False,
+) -> QueryDecomposer | None:
+    """Build a query decomposer if requested."""
+    if not enabled:
+        return None
+    return QueryDecomposer(llm=llm, config=DecomposerConfig(enabled=True))
+
+
+def _build_reranker(
+    retrieve_documents: RetrieveDocumentsUseCase,
+    enabled: bool = False,
+    beta: float = 0.7,
+) -> GraphReranker | None:
+    """Build a graph reranker using the pipeline's graph repository."""
+    if not enabled:
+        return None
+    graph_repository = retrieve_documents.graph_expand.graph_repository
+    return GraphReranker(index=graph_repository, config=RerankConfig(enabled=True, beta=beta))
+
+
+def default_search_config(config: AppConfig | None = None) -> SearchConfig:
+    """Return the default ``SearchConfig`` for the given ``AppConfig``."""
+    return _search_config_from_app(config)

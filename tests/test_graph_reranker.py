@@ -2,36 +2,44 @@
 
 from __future__ import annotations
 
-import numpy as np
-
+from src.domain.entities.retrieval_result import RetrievalResult
 from src.graph_reranker import GraphReranker, RerankConfig, create_graph_reranker
-from src.retriever import RetrievalResult
 
 
 class _FakeIndex:
-    """Minimal fake ArtifactIndex for reranker tests."""
+    """Minimal fake graph repository for reranker tests."""
 
     def __init__(self) -> None:
-        self.chunks = []
-        self.embeddings = np.zeros((0, 384), dtype=np.float32)
-        self.chunk_by_id: dict[str, dict] = {}
-        self.row_by_chunk_id: dict[str, int] = {}
-        self.article_chunks: dict[str, set[str]] = {}
-        self.entity_chunks: dict[str, set[str]] = {
+        self._entity_chunks: dict[str, set[str]] = {
             "e1": {"c1", "c2", "c3"},
             "e2": {"c1", "c3"},
             "e3": {"c2"},
         }
-        self.chunk_entities: dict[str, set[str]] = {
+        self._chunk_entities: dict[str, set[str]] = {
             "c1": {"e1", "e2"},
             "c2": {"e1", "e3"},
             "c3": {"e1", "e2"},
         }
-        self.entity_degrees: dict[str, int] = {
+        self._entity_degrees: dict[str, int] = {
             "e1": 3,
             "e2": 2,
             "e3": 1,
         }
+
+    def get_chunk_article(self, chunk_id: str) -> str:
+        return "a1"
+
+    def get_article_chunks(self, article_id: str) -> set[str]:
+        return {"c1", "c2", "c3"}
+
+    def get_chunk_entities(self, chunk_id: str) -> set[str]:
+        return self._chunk_entities.get(chunk_id, set())
+
+    def get_entity_chunks(self, entity_id: str) -> set[str]:
+        return self._entity_chunks.get(entity_id, set())
+
+    def get_entity_degree(self, entity_id: str) -> int:
+        return self._entity_degrees.get(entity_id, 0)
 
 
 def _make_result(

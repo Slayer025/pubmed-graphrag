@@ -11,17 +11,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
+
+from src.application.ports import LLMClient
 
 logger = logging.getLogger(__name__)
-
-
-class LLMClient(Protocol):
-    """Subset of the LLMClient protocol used by the decomposer."""
-
-    def complete(self, prompt: str, **kwargs: Any) -> str:
-        ...
-
 
 DEFAULT_DECOMPOSITION_PROMPT = (
     "You are a biomedical research assistant. Decompose the following question "
