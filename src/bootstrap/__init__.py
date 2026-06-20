@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 from src.application.dto.rerank_config import RerankConfig
@@ -27,7 +26,7 @@ from src.infrastructure.embeddings.sentence_transformer_service import (
     SentenceTransformerEmbeddingService,
 )
 from src.infrastructure.graph.in_memory_graph_repository import InMemoryGraphRepository
-from src.infrastructure.storage.artifact_loader import ArtifactLoader, LoadedArtifacts
+from src.infrastructure.storage.artifact_loader import LoadedArtifacts
 from src.infrastructure.storage.chunk_repository import InMemoryChunkRepository
 from src.infrastructure.storage.pure_build import pure_build_guard
 from src.infrastructure.vector_store.numpy_vector_store import NumpyVectorStore
@@ -41,9 +40,11 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def _load_artifacts() -> LoadedArtifacts:
     """Load Phase 1/2 artifacts exactly once per process."""
-    cfg = AppConfig.default()
+    from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts, default_cache_dir, get_preloaded_artifacts
+
     logger.info("Loading artifacts...")
-    return ArtifactLoader.load(cfg)
+    bootstrap_artifacts(default_cache_dir())
+    return get_preloaded_artifacts()
 
 
 @lru_cache(maxsize=1)
@@ -95,36 +96,12 @@ def _search_config_from_app(config: AppConfig | None = None) -> SearchConfig:
 
 def build_pipeline(
     *,
-    cache_dir: str,
     hf_home: str,
-    chunks_path: str,
-    embeddings_path: str,
-    mentions_path: str,
-    has_chunk_path: str,
-    entities_path: str,
+    artifacts: LoadedArtifacts,
 ) -> RAGPipeline:
-    """Build the retrieval stack from pre-resolved paths (pure: no downloads, no HF load)."""
-    _ = cache_dir
+    """Build the retrieval stack from preloaded in-memory artifacts (pure: no IO)."""
     with pure_build_guard():
-        for path in (
-            chunks_path,
-            embeddings_path,
-            mentions_path,
-            has_chunk_path,
-            entities_path,
-        ):
-            if not Path(path).is_file():
-                raise FileNotFoundError(f"Artifact missing before pipeline build: {path}")
-
         app_config = AppConfig.default()
-        artifacts = ArtifactLoader.load_from_paths(
-            chunks_path,
-            embeddings_path,
-            mentions_path,
-            has_chunk_path,
-            entities_path,
-            embedding_dim=app_config.embedding.embedding_dim,
-        )
         embedding_service = LazySentenceTransformerEmbeddingService(
             model_name=app_config.embedding.model_name,
             hf_home=hf_home,
@@ -143,14 +120,13 @@ def build_pipeline(
             graph_repository=graph_repository,
             chunk_repository=chunk_repository,
         )
-        pipeline = RAGPipeline(
+        return RAGPipeline(
             retrieve_documents=retrieve_documents,
             generate_answer=None,
             llm=None,
             decomposer=None,
             reranker=None,
         )
-        return pipeline
 
 
 def bootstrap_retriever(config: AppConfig | None = None) -> "Retriever":

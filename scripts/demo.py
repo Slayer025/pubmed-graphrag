@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.bootstrap.environment import configure_environment
 
 configure_environment()
+
+CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
+
+from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts
+
+bootstrap_artifacts(CACHE_DIR)
 
 from src.interfaces.streamlit.demo import main
 

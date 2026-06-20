@@ -19,6 +19,14 @@ from src.bootstrap.environment import configure_environment
 
 configure_environment()
 
+CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
+HF_HOME = os.environ.get("HF_HOME", "/tmp/hf_cache")
+
+from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts, is_bootstrap_complete, mark_streamlit_runtime
+
+if not is_bootstrap_complete():
+    bootstrap_artifacts(CACHE_DIR)
+
 try:
     import streamlit as st
 except ImportError as exc:
@@ -29,15 +37,17 @@ except ImportError as exc:
     )
     raise SystemExit(1)
 
+mark_streamlit_runtime()
+
 from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
 from src.application.use_cases.generate_answer import GenerateAnswerUseCase
 from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
 from src.bootstrap import build_pipeline, default_search_config
+from src.bootstrap.bootstrap_artifacts import get_preloaded_artifacts
 from src.domain.entities.retrieval_result import RetrievalResult
 from src.domain.value_objects.query import Query
 from src.graph_reranker import GraphReranker
-from src.infrastructure.storage.artifact_loader import ensure_artifacts_present
 from src.llm_client import create_llm_client
 from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
@@ -49,38 +59,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
-HF_HOME = os.environ.get("HF_HOME", "/tmp/hf_cache")
-
 
 @st.cache_resource(show_spinner=False)
-def _artifact_paths(cache_dir: str) -> tuple[str, str, str, str, str]:
-    """Ensure artifacts exist on disk once per session (before pipeline cache)."""
-    return ensure_artifacts_present(cache_dir)
-
-
-@st.cache_resource(show_spinner=False)
-def get_pipeline(
-    cache_dir: str,
-    hf_home: str,
-    chunks_path: str,
-    embeddings_path: str,
-    mentions_path: str,
-    has_chunk_path: str,
-    entities_path: str,
-) -> RAGPipeline:
-    """Bootstrap the heavy retrieval stack once per deterministic cache key."""
+def get_pipeline(hf_home: str) -> RAGPipeline:
+    """Bootstrap the heavy retrieval stack once per session (pure, no IO)."""
     print("PIPELINE BUILD START (PURE)", flush=True)
     logger.info("PIPELINE BUILD START (PURE)")
-    pipeline = build_pipeline(
-        cache_dir=cache_dir,
-        hf_home=hf_home,
-        chunks_path=chunks_path,
-        embeddings_path=embeddings_path,
-        mentions_path=mentions_path,
-        has_chunk_path=has_chunk_path,
-        entities_path=entities_path,
-    )
+    pipeline = build_pipeline(hf_home=hf_home, artifacts=get_preloaded_artifacts())
     print("PIPELINE BUILD END (PURE)", flush=True)
     logger.info("PIPELINE BUILD END (PURE)")
     print("PIPELINE INIT CALLED", flush=True)
@@ -300,18 +285,7 @@ def main() -> int:
     }
 
     try:
-        chunks_path, embeddings_path, mentions_path, has_chunk_path, entities_path = _artifact_paths(
-            CACHE_DIR
-        )
-        pipeline = get_pipeline(
-            CACHE_DIR,
-            HF_HOME,
-            chunks_path,
-            embeddings_path,
-            mentions_path,
-            has_chunk_path,
-            entities_path,
-        )
+        pipeline = get_pipeline(HF_HOME)
         base_config = default_search_config()
         search_config = _build_search_config(base_config, retrieval_overrides)
         retrieve_documents = pipeline.retrieve_documents

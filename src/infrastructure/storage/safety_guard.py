@@ -87,9 +87,9 @@ def configure_external_model_caches() -> None:
 
 def log_startup_diagnostics() -> None:
     """Log cache locations and write-protection status at process startup."""
-    from src.infrastructure.storage.artifact_loader import get_cache_dir
+    from src.bootstrap.bootstrap_artifacts import default_cache_dir
 
-    cache_dir = get_cache_dir()
+    cache_dir = default_cache_dir()
     repo_root = detect_repo_root()
 
     lines = (
