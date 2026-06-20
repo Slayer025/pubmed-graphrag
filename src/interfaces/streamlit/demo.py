@@ -48,8 +48,8 @@ def get_pipeline(
     use_decomposer: bool,
 ) -> RAGPipeline:
     """Bootstrap the RAG pipeline once per deterministic cache key."""
-    print("PIPELINE CREATED (actual execution)", flush=True)
-    logger.info("PIPELINE CREATED (actual execution)")
+    print("PIPELINE INIT CALLED", flush=True)
+    logger.info("PIPELINE INIT CALLED")
     return bootstrap_pipeline(
         llm_client_type=llm_client_type,
         use_reranker=use_reranker,

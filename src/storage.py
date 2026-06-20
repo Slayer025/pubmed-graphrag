@@ -155,8 +155,10 @@ def configure_hf_home(hf_home: Path | str | None = None) -> Path:
     Returns:
         Resolved absolute cache root.
     """
+    from src.infrastructure.storage.safety_guard import safe_mkdir
+
     cache_root = Path(hf_home or os.environ.get("HF_HOME", DEFAULT_HF_HOME)).resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(cache_root)
 
     # Standard HuggingFace env vars — set explicitly so downstream libraries
     # agree on one location regardless of shell defaults.
@@ -164,8 +166,8 @@ def configure_hf_home(hf_home: Path | str | None = None) -> Path:
     os.environ["HF_DATASETS_CACHE"] = str(cache_root / "datasets")
     os.environ["HF_HUB_CACHE"] = str(cache_root / "hub")
 
-    (cache_root / "datasets").mkdir(parents=True, exist_ok=True)
-    (cache_root / "hub").mkdir(parents=True, exist_ok=True)
+    safe_mkdir(cache_root / "datasets")
+    safe_mkdir(cache_root / "hub")
 
     logger.info("HuggingFace cache directory: %s", cache_root)
     return cache_root

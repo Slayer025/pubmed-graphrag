@@ -15,6 +15,13 @@ import requests
 from src.config import AppConfig
 from src.embeddings import normalize_embeddings
 from src.infrastructure.storage.csv_loader import load_csv
+from src.infrastructure.storage.safety_guard import (
+    assert_no_repo_write,
+    detect_repo_root,
+    safe_mkdir,
+    safe_write_file,
+    verify_no_repo_writes,
+)
 from src.storage import iter_jsonl_gz
 
 logger = logging.getLogger(__name__)
@@ -23,8 +30,6 @@ MIN_VALID_SIZE_DEFAULT = 1024
 
 # Remote artifact base URL (Streamlit Cloud). Override via ARTIFACT_BASE_URL.
 ARTIFACT_BASE_URL = os.environ.get("ARTIFACT_BASE_URL", "TODO_SET_THIS")
-
-_ILLEGAL_REPO_PREFIX = "/mount/src/"
 
 _ARTIFACT_REMOTE_NAMES: dict[str, str] = {
     "data/chunks/chunks_semantic.jsonl.gz": "chunks_semantic.jsonl.gz",
@@ -45,7 +50,7 @@ _MIN_VALID_SIZES: dict[str, int] = {
 
 def _repo_root() -> Path:
     """Return repository root without relying on process cwd."""
-    return Path(__file__).resolve().parents[3]
+    return detect_repo_root()
 
 
 def _normalize_relative(path: Path | str) -> str:
@@ -53,17 +58,6 @@ def _normalize_relative(path: Path | str) -> str:
     if candidate.is_absolute():
         return candidate.relative_to(_repo_root()).as_posix()
     return candidate.as_posix()
-
-
-def _assert_not_repo_write(path: Path) -> None:
-    """Raise if a write target would land inside the watched repo tree."""
-    resolved = str(path.resolve())
-    if resolved.startswith(_ILLEGAL_REPO_PREFIX):
-        raise RuntimeError(f"Illegal write to repo detected: {resolved}")
-
-    repo = str(_repo_root().resolve())
-    if resolved == repo or resolved.startswith(f"{repo}{os.sep}"):
-        raise RuntimeError(f"Illegal write to repo detected: {resolved}")
 
 
 @lru_cache(maxsize=1)
@@ -75,8 +69,8 @@ def get_cache_dir() -> Path:
     else:
         root = Path("/tmp/pubmed-graphrag").resolve()
 
-    _assert_not_repo_write(root)
-    root.mkdir(parents=True, exist_ok=True)
+    assert_no_repo_write(str(root))
+    safe_mkdir(root)
     logger.info("CACHE_DIR=%s", root)
     print(f"CACHE_DIR={root}", flush=True)
     return root
@@ -86,7 +80,7 @@ def get_cache_path(relative_path: Path | str) -> Path:
     """Map a repo-relative artifact path to ``{CACHE_DIR}/data/...``."""
     rel = _normalize_relative(relative_path)
     dest = (get_cache_dir() / rel).resolve()
-    _assert_not_repo_write(dest)
+    assert_no_repo_write(str(dest))
     return dest
 
 
@@ -131,10 +125,9 @@ def download_if_missing(url: str, logical: Path | str) -> Path:
         logger.info("USING CACHED ARTIFACT: %s", dest)
         return dest
 
-    _assert_not_repo_write(dest.parent)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    safe_mkdir(dest.parent)
     part_path = Path(f"{dest}.part").resolve()
-    _assert_not_repo_write(part_path)
+    assert_no_repo_write(str(part_path))
 
     logger.info("DOWNLOADING ARTIFACT: %s from %s", dest, url)
 
@@ -142,7 +135,7 @@ def download_if_missing(url: str, logical: Path | str) -> Path:
         response = requests.get(url, timeout=300, stream=True)
         response.raise_for_status()
 
-        with open(part_path, "wb") as handle:
+        with safe_write_file(part_path, "wb") as handle:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     handle.write(chunk)
@@ -152,6 +145,7 @@ def download_if_missing(url: str, logical: Path | str) -> Path:
         if not part_path.is_file() or os.path.getsize(part_path) == 0:
             raise OSError(f"Download produced empty file: {part_path}")
 
+        assert_no_repo_write(str(dest))
         os.replace(part_path, dest)
         logger.info("DOWNLOAD COMPLETED: %s (%d bytes)", dest, os.path.getsize(dest))
         return dest
@@ -238,6 +232,15 @@ class ArtifactLoader:
         mentions_path = resolve_artifact_path(artifact.mentions_path)
         has_chunk_path = resolve_artifact_path(artifact.has_chunk_path)
         entities_path = resolve_artifact_path(artifact.entities_path)
+
+        resolved_paths = [
+            str(chunks_path),
+            str(embeddings_path),
+            str(mentions_path),
+            str(has_chunk_path),
+            str(entities_path),
+        ]
+        verify_no_repo_writes(resolved_paths)
 
         chunks = list(iter_jsonl_gz(chunks_path))
         embeddings = np.load(embeddings_path)

@@ -48,9 +48,12 @@ def create_embedding_model(model_name: str = DEFAULT_MODEL_NAME) -> Any:
     Returns:
         A loaded SentenceTransformer model instance.
     """
+    import os
+
     from sentence_transformers import SentenceTransformer
 
     configure_hf_home()
+    cache_folder = os.environ.get("HF_HOME", "/tmp/hf_cache")
 
     candidates: list[str] = []
     for name in (model_name, DEFAULT_MODEL_NAME, "all-MiniLM-L6-v2"):
@@ -63,7 +66,7 @@ def create_embedding_model(model_name: str = DEFAULT_MODEL_NAME) -> Any:
         logger.info("Loading embedding model %s", name)
         t0 = time.perf_counter()
         try:
-            model = SentenceTransformer(name)
+            model = SentenceTransformer(name, cache_folder=cache_folder)
         except Exception as exc:
             last_error = exc
             logger.warning("Failed to load embedding model %s: %s", name, exc)

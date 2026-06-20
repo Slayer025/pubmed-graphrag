@@ -13,6 +13,14 @@ import logging
 from functools import lru_cache
 from typing import Any
 
+from src.infrastructure.storage.safety_guard import (
+    configure_external_model_caches,
+    log_startup_diagnostics,
+)
+
+configure_external_model_caches()
+log_startup_diagnostics()
+
 from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
 from src.application.ports import LLMClient
@@ -140,8 +148,6 @@ def bootstrap_pipeline(
     not provided but ``llm_client_type`` is given, the LLM client is created by
     the bootstrap container.
     """
-    print("PIPELINE INIT", flush=True)
-    logger.info("PIPELINE INIT")
     if llm is None and llm_client_type:
         llm = create_llm_client(llm_client_type)
 
