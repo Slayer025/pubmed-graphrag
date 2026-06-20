@@ -54,6 +54,10 @@ def create_embedding_model(
     Returns:
         A loaded SentenceTransformer model instance.
     """
+    from src.infrastructure.storage.pure_build import assert_not_during_pure_build
+
+    assert_not_during_pure_build("HuggingFace model loading")
+
     from sentence_transformers import SentenceTransformer
 
     if cache_folder is None:

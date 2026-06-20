@@ -10,8 +10,8 @@ UI layers (Streamlit, CLI, scripts) should call ``bootstrap_pipeline()`` or
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from src.application.dto.rerank_config import RerankConfig
@@ -23,25 +23,19 @@ from src.config import AppConfig
 from src.embeddings import create_embedding_model
 from src.graph_reranker import GraphReranker
 from src.infrastructure.embeddings.sentence_transformer_service import (
+    LazySentenceTransformerEmbeddingService,
     SentenceTransformerEmbeddingService,
 )
 from src.infrastructure.graph.in_memory_graph_repository import InMemoryGraphRepository
-from src.infrastructure.storage.artifact_loader import ArtifactLoader, LoadedArtifacts, set_artifact_cache_dir
+from src.infrastructure.storage.artifact_loader import ArtifactLoader, LoadedArtifacts
 from src.infrastructure.storage.chunk_repository import InMemoryChunkRepository
+from src.infrastructure.storage.pure_build import pure_build_guard
 from src.infrastructure.vector_store.numpy_vector_store import NumpyVectorStore
 from src.llm_client import create_llm_client
 from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class PipelineBuildConfig:
-    """Deterministic paths for Streamlit-cached pipeline construction."""
-
-    cache_dir: str = "/tmp/pubmed-graphrag"
-    hf_home: str = "/tmp/hf_cache"
 
 
 @lru_cache(maxsize=1)
@@ -99,40 +93,64 @@ def _search_config_from_app(config: AppConfig | None = None) -> SearchConfig:
     return SearchConfig.from_retrieval_config(cfg.retrieval)
 
 
-def build_pipeline(*, config: PipelineBuildConfig) -> RAGPipeline:
-    """Build the retrieval stack using explicit config only (Streamlit-safe)."""
-    set_artifact_cache_dir(config.cache_dir)
+def build_pipeline(
+    *,
+    cache_dir: str,
+    hf_home: str,
+    chunks_path: str,
+    embeddings_path: str,
+    mentions_path: str,
+    has_chunk_path: str,
+    entities_path: str,
+) -> RAGPipeline:
+    """Build the retrieval stack from pre-resolved paths (pure: no downloads, no HF load)."""
+    _ = cache_dir
+    with pure_build_guard():
+        for path in (
+            chunks_path,
+            embeddings_path,
+            mentions_path,
+            has_chunk_path,
+            entities_path,
+        ):
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"Artifact missing before pipeline build: {path}")
 
-    app_config = AppConfig.default()
-    artifacts = ArtifactLoader.load(app_config)
-    model = create_embedding_model(
-        app_config.embedding.model_name,
-        cache_folder=config.hf_home,
-    )
-    embedding_service = SentenceTransformerEmbeddingService(
-        model=model,
-        batch_size=app_config.embedding.batch_size,
-        normalize=app_config.embedding.normalize,
-    )
-    graph_repository = InMemoryGraphRepository(
-        artifacts.mentions,
-        artifacts.has_chunk,
-        artifacts.chunks,
-    )
-    chunk_repository = InMemoryChunkRepository(artifacts.chunks)
-    retrieve_documents = RetrieveDocumentsUseCase(
-        embedding_service=embedding_service,
-        vector_store=NumpyVectorStore(artifacts.chunks, artifacts.embeddings),
-        graph_repository=graph_repository,
-        chunk_repository=chunk_repository,
-    )
-    return RAGPipeline(
-        retrieve_documents=retrieve_documents,
-        generate_answer=None,
-        llm=None,
-        decomposer=None,
-        reranker=None,
-    )
+        app_config = AppConfig.default()
+        artifacts = ArtifactLoader.load_from_paths(
+            chunks_path,
+            embeddings_path,
+            mentions_path,
+            has_chunk_path,
+            entities_path,
+            embedding_dim=app_config.embedding.embedding_dim,
+        )
+        embedding_service = LazySentenceTransformerEmbeddingService(
+            model_name=app_config.embedding.model_name,
+            hf_home=hf_home,
+            batch_size=app_config.embedding.batch_size,
+            normalize=app_config.embedding.normalize,
+        )
+        graph_repository = InMemoryGraphRepository(
+            artifacts.mentions,
+            artifacts.has_chunk,
+            artifacts.chunks,
+        )
+        chunk_repository = InMemoryChunkRepository(artifacts.chunks)
+        retrieve_documents = RetrieveDocumentsUseCase(
+            embedding_service=embedding_service,
+            vector_store=NumpyVectorStore(artifacts.chunks, artifacts.embeddings),
+            graph_repository=graph_repository,
+            chunk_repository=chunk_repository,
+        )
+        pipeline = RAGPipeline(
+            retrieve_documents=retrieve_documents,
+            generate_answer=None,
+            llm=None,
+            decomposer=None,
+            reranker=None,
+        )
+        return pipeline
 
 
 def bootstrap_retriever(config: AppConfig | None = None) -> "Retriever":

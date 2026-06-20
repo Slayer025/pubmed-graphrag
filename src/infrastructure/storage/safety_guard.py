@@ -42,6 +42,9 @@ def detect_repo_root() -> Path:
     return Path.cwd().resolve()
 
 
+from src.infrastructure.storage.pure_build import assert_not_during_pure_build
+
+
 def assert_no_repo_write(path: str) -> None:
     """Raise if ``path`` would write inside the watched repository tree."""
     resolved = str(Path(path).resolve())
@@ -56,6 +59,7 @@ def assert_no_repo_write(path: str) -> None:
 
 def safe_mkdir(path: str | Path) -> None:
     """Create a directory only when the target is outside the repository."""
+    assert_not_during_pure_build("directory creation")
     assert_no_repo_write(str(path))
     os.makedirs(path, exist_ok=True)
 
@@ -63,6 +67,7 @@ def safe_mkdir(path: str | Path) -> None:
 @contextmanager
 def safe_write_file(path: str | Path, mode: str = "wb") -> Iterator[object]:
     """Open a file for writing after enforcing repository write protection."""
+    assert_not_during_pure_build("file write")
     assert_no_repo_write(str(path))
     with open(path, mode) as handle:
         yield handle
@@ -78,36 +83,6 @@ def configure_external_model_caches() -> None:
     safe_mkdir(_DEFAULT_TORCH_HOME)
     safe_mkdir(os.path.join(_DEFAULT_HF_HOME, "datasets"))
     safe_mkdir(os.path.join(_DEFAULT_HF_HOME, "hub"))
-
-
-def detect_streamlit_cache_flapping(config_hash: str) -> None:
-    """Log when rerun-time state changes in ways that can invalidate Streamlit caches."""
-    import sys
-
-    snapshot = {
-        "config_hash": config_hash,
-        "HF_HOME": os.environ.get("HF_HOME"),
-        "TORCH_HOME": os.environ.get("TORCH_HOME"),
-        "TRANSFORMERS_CACHE": os.environ.get("TRANSFORMERS_CACHE"),
-        "modules_size": len(sys.modules),
-    }
-
-    previous = getattr(detect_streamlit_cache_flapping, "_previous", None)
-    if previous is not None and previous != snapshot:
-        logger.warning(
-            "STREAMLIT CACHE INVALIDATION SOURCE DETECTED: %s -> %s",
-            previous,
-            snapshot,
-        )
-    detect_streamlit_cache_flapping._previous = snapshot  # type: ignore[attr-defined]
-
-    logger.info(
-        "streamlit cache snapshot config_hash=%s HF_HOME=%s TORCH_HOME=%s modules=%d",
-        config_hash,
-        snapshot["HF_HOME"],
-        snapshot["TORCH_HOME"],
-        snapshot["modules_size"],
-    )
 
 
 def log_startup_diagnostics() -> None:

@@ -7,7 +7,6 @@ import io
 import logging
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +33,11 @@ from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
 from src.application.use_cases.generate_answer import GenerateAnswerUseCase
 from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
-from src.bootstrap import PipelineBuildConfig, build_pipeline, default_search_config
+from src.bootstrap import build_pipeline, default_search_config
 from src.domain.entities.retrieval_result import RetrievalResult
 from src.domain.value_objects.query import Query
 from src.graph_reranker import GraphReranker
-from src.infrastructure.storage.safety_guard import detect_streamlit_cache_flapping
+from src.infrastructure.storage.artifact_loader import ensure_artifacts_present
 from src.llm_client import create_llm_client
 from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
@@ -50,35 +49,43 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    """Deterministic Streamlit cache key for the heavy retrieval stack."""
-
-    cache_dir: str = "/tmp/pubmed-graphrag"
-    hf_home: str = "/tmp/hf_cache"
-
-
-def _pipeline_config_from_process_defaults() -> PipelineConfig:
-    cache_dir = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
-    hf_home = os.environ.get("HF_HOME", "/tmp/hf_cache")
-    return PipelineConfig(cache_dir=cache_dir, hf_home=hf_home)
-
-
-PIPELINE_CONFIG = _pipeline_config_from_process_defaults()
+CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
+HF_HOME = os.environ.get("HF_HOME", "/tmp/hf_cache")
 
 
 @st.cache_resource(show_spinner=False)
-def get_pipeline(_config: PipelineConfig) -> RAGPipeline:
+def _artifact_paths(cache_dir: str) -> tuple[str, str, str, str, str]:
+    """Ensure artifacts exist on disk once per session (before pipeline cache)."""
+    return ensure_artifacts_present(cache_dir)
+
+
+@st.cache_resource(show_spinner=False)
+def get_pipeline(
+    cache_dir: str,
+    hf_home: str,
+    chunks_path: str,
+    embeddings_path: str,
+    mentions_path: str,
+    has_chunk_path: str,
+    entities_path: str,
+) -> RAGPipeline:
     """Bootstrap the heavy retrieval stack once per deterministic cache key."""
+    print("PIPELINE BUILD START (PURE)", flush=True)
+    logger.info("PIPELINE BUILD START (PURE)")
+    pipeline = build_pipeline(
+        cache_dir=cache_dir,
+        hf_home=hf_home,
+        chunks_path=chunks_path,
+        embeddings_path=embeddings_path,
+        mentions_path=mentions_path,
+        has_chunk_path=has_chunk_path,
+        entities_path=entities_path,
+    )
+    print("PIPELINE BUILD END (PURE)", flush=True)
+    logger.info("PIPELINE BUILD END (PURE)")
     print("PIPELINE INIT CALLED", flush=True)
     logger.info("PIPELINE INIT CALLED")
-    return build_pipeline(
-        config=PipelineBuildConfig(
-            cache_dir=_config.cache_dir,
-            hf_home=_config.hf_home,
-        )
-    )
+    return pipeline
 
 
 def _build_search_config(base: SearchConfig, overrides: dict[str, Any]) -> SearchConfig:
@@ -244,8 +251,6 @@ def _render_graph_evidence(graph_repository: Any, results: list[RetrievalResult]
 
 
 def main() -> int:
-    detect_streamlit_cache_flapping(str(hash(PIPELINE_CONFIG)))
-
     st.set_page_config(page_title="PubMed GraphRAG Demo", layout="wide")
     st.title("🧬 PubMed GraphRAG Demo")
     st.markdown(
@@ -295,7 +300,18 @@ def main() -> int:
     }
 
     try:
-        pipeline = get_pipeline(PIPELINE_CONFIG)
+        chunks_path, embeddings_path, mentions_path, has_chunk_path, entities_path = _artifact_paths(
+            CACHE_DIR
+        )
+        pipeline = get_pipeline(
+            CACHE_DIR,
+            HF_HOME,
+            chunks_path,
+            embeddings_path,
+            mentions_path,
+            has_chunk_path,
+            entities_path,
+        )
         base_config = default_search_config()
         search_config = _build_search_config(base_config, retrieval_overrides)
         retrieve_documents = pipeline.retrieve_documents

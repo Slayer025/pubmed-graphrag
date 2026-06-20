@@ -15,6 +15,7 @@ import requests
 from src.config import AppConfig
 from src.embeddings import normalize_embeddings
 from src.infrastructure.storage.csv_loader import load_csv
+from src.infrastructure.storage.pure_build import assert_not_during_pure_build
 from src.infrastructure.storage.safety_guard import (
     assert_no_repo_write,
     detect_repo_root,
@@ -52,6 +53,7 @@ _explicit_cache_root: Path | None = None
 
 def set_artifact_cache_dir(cache_dir: str) -> None:
     """Pin artifact downloads to an explicit external cache directory."""
+    assert_not_during_pure_build("artifact cache mutation")
     global _explicit_cache_root
     root = Path(cache_dir).resolve()
     assert_no_repo_write(str(root))
@@ -128,6 +130,7 @@ def resolve_artifact_path(logical: Path | str) -> Path:
 
 def download_if_missing(url: str, logical: Path | str) -> Path:
     """Download to the external cache directory if the artifact file is missing."""
+    assert_not_during_pure_build("artifact download")
     dest = get_cache_path(logical)
 
     if _cache_hit(dest):
@@ -196,6 +199,23 @@ def _ensure_artifact(logical: Path | str) -> Path:
     return download_if_missing(url, logical)
 
 
+def ensure_artifacts_present(cache_dir: str) -> tuple[str, str, str, str, str]:
+    """Download missing deployment artifacts to external cache; return resolved paths."""
+    set_artifact_cache_dir(cache_dir)
+    cfg = AppConfig.default()
+    artifact = cfg.artifact
+    logical_paths = (
+        artifact.chunks_path,
+        artifact.embeddings_path,
+        artifact.mentions_path,
+        artifact.has_chunk_path,
+        artifact.entities_path,
+    )
+    resolved = tuple(str(_ensure_artifact(path)) for path in logical_paths)
+    verify_no_repo_writes(list(resolved))
+    return resolved  # type: ignore[return-value]
+
+
 def _download_if_missing() -> tuple[str, ...]:
     """Ensure all deployment artifacts exist (writes only to external cache)."""
     cfg = AppConfig.default()
@@ -231,6 +251,54 @@ class ArtifactLoader:
     """Load and validate chunks, embeddings, mentions, and graph edges."""
 
     @staticmethod
+    def load_from_paths(
+        chunks_path: str,
+        embeddings_path: str,
+        mentions_path: str,
+        has_chunk_path: str,
+        entities_path: str,
+        *,
+        embedding_dim: int,
+    ) -> LoadedArtifacts:
+        """Load artifacts from existing on-disk paths (read-only, no downloads)."""
+        for path in (chunks_path, embeddings_path, mentions_path, has_chunk_path, entities_path):
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"Artifact missing: {path}")
+
+        verify_no_repo_writes(
+            [chunks_path, embeddings_path, mentions_path, has_chunk_path, entities_path]
+        )
+
+        chunks = list(iter_jsonl_gz(Path(chunks_path)))
+        embeddings = np.load(embeddings_path)
+
+        if embeddings.shape[0] != len(chunks):
+            raise ValueError(
+                f"Embedding rows ({embeddings.shape[0]}) do not match chunk count ({len(chunks)})."
+            )
+
+        if embeddings.shape[1] != embedding_dim:
+            raise ValueError(
+                f"Embedding dimension ({embeddings.shape[1]}) does not match config ({embedding_dim})."
+            )
+
+        embeddings = normalize_embeddings(embeddings)
+
+        mentions = load_csv(Path(mentions_path), ["chunk_id", "entity_id"])
+        has_chunk = load_csv(Path(has_chunk_path), ["article_id", "chunk_id"])
+        entities = load_csv(Path(entities_path), ["entity_id", "name", "label"])
+
+        ArtifactLoader._validate_mentions(chunks, mentions)
+
+        return LoadedArtifacts(
+            chunks=chunks,
+            embeddings=embeddings,
+            mentions=mentions,
+            has_chunk=has_chunk,
+            entities=entities,
+        )
+
+    @staticmethod
     def load(config: AppConfig) -> LoadedArtifacts:
         artifact = config.artifact
 
@@ -242,43 +310,13 @@ class ArtifactLoader:
         has_chunk_path = resolve_artifact_path(artifact.has_chunk_path)
         entities_path = resolve_artifact_path(artifact.entities_path)
 
-        resolved_paths = [
+        return ArtifactLoader.load_from_paths(
             str(chunks_path),
             str(embeddings_path),
             str(mentions_path),
             str(has_chunk_path),
             str(entities_path),
-        ]
-        verify_no_repo_writes(resolved_paths)
-
-        chunks = list(iter_jsonl_gz(chunks_path))
-        embeddings = np.load(embeddings_path)
-
-        if embeddings.shape[0] != len(chunks):
-            raise ValueError(
-                f"Embedding rows ({embeddings.shape[0]}) do not match chunk count ({len(chunks)})."
-            )
-
-        expected_dim = config.embedding.embedding_dim
-        if embeddings.shape[1] != expected_dim:
-            raise ValueError(
-                f"Embedding dimension ({embeddings.shape[1]}) does not match config ({expected_dim})."
-            )
-
-        embeddings = normalize_embeddings(embeddings)
-
-        mentions = load_csv(mentions_path, ["chunk_id", "entity_id"])
-        has_chunk = load_csv(has_chunk_path, ["article_id", "chunk_id"])
-        entities = load_csv(entities_path, ["entity_id", "name", "label"])
-
-        ArtifactLoader._validate_mentions(chunks, mentions)
-
-        return LoadedArtifacts(
-            chunks=chunks,
-            embeddings=embeddings,
-            mentions=mentions,
-            has_chunk=has_chunk,
-            entities=entities,
+            embedding_dim=config.embedding.embedding_dim,
         )
 
     @staticmethod
