@@ -198,32 +198,15 @@ def main() -> int:
     }
 
     embedding_model_name = AppConfig.default().embedding.model_name
-    pipeline_key = (
-        llm_client_type,
-        embedding_model_name,
-        use_reranker,
-        reranker_beta,
-        use_decomposer,
-    )
 
     try:
-        if "pipeline_initialized" not in st.session_state:
-            st.session_state.pipeline_initialized = True
-
-        if (
-            st.session_state.get("pipeline_key") != pipeline_key
-            or "pipeline" not in st.session_state
-        ):
-            st.session_state.pipeline_key = pipeline_key
-            st.session_state.pipeline = get_pipeline(
-                llm_client_type=llm_client_type,
-                embedding_model_name=embedding_model_name,
-                use_reranker=use_reranker,
-                reranker_beta=reranker_beta,
-                use_decomposer=use_decomposer,
-            )
-
-        pipeline = st.session_state.pipeline
+        pipeline = get_pipeline(
+            llm_client_type=llm_client_type,
+            embedding_model_name=embedding_model_name,
+            use_reranker=use_reranker,
+            reranker_beta=reranker_beta,
+            use_decomposer=use_decomposer,
+        )
         base_config = default_search_config()
         search_config = _build_search_config(base_config, retrieval_overrides)
         graph_repository = pipeline.retrieve_documents.graph_expand.graph_repository

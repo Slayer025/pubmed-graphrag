@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -21,11 +20,8 @@ from src.storage import iter_jsonl_gz
 logger = logging.getLogger(__name__)
 
 MIN_VALID_SIZE_DEFAULT = 1024
-LOCK_RETRY_MS = 300
-LOCK_RETRY_ATTEMPTS = 10
 
-# Base URL for Streamlit Cloud / fresh-container bootstrap.
-# Override via ARTIFACT_BASE_URL env var (no trailing slash required).
+# Remote artifact base URL (Streamlit Cloud). Override via ARTIFACT_BASE_URL.
 ARTIFACT_BASE_URL = os.environ.get("ARTIFACT_BASE_URL", "TODO_SET_THIS")
 
 _ARTIFACT_REMOTE_NAMES: dict[str, str] = {
@@ -45,225 +41,147 @@ _MIN_VALID_SIZES: dict[str, int] = {
 }
 
 
-@dataclass(frozen=True)
-class _ArtifactPaths:
-    """All filesystem paths for one artifact, resolved once."""
-
-    base: Path
-    ready: Path
-    lock: Path
-    part: Path
-
-
 def _repo_root() -> Path:
     """Return repository root without relying on process cwd."""
     return Path(__file__).resolve().parents[3]
 
 
-def _resolve_artifact_path(path: Path | str) -> Path:
-    """Normalize to a single absolute resolved path (no relative paths)."""
+def _logical_relative(path: Path | str) -> str:
     candidate = Path(path)
-    if not candidate.is_absolute():
-        candidate = _repo_root() / candidate
-    return candidate.resolve()
+    if candidate.is_absolute():
+        return candidate.relative_to(_repo_root()).as_posix()
+    return candidate.as_posix()
 
 
-def _artifact_paths(path: Path | str) -> _ArtifactPaths:
-    """Build consistent resolved paths for base, .ready, .lock, and .part."""
-    base = _resolve_artifact_path(path)
-    return _ArtifactPaths(
-        base=base,
-        ready=Path(f"{base}.ready").resolve(),
-        lock=Path(f"{base}.lock").resolve(),
-        part=Path(f"{base}.part").resolve(),
-    )
+@lru_cache(maxsize=1)
+def _artifact_cache_root() -> Path:
+    """Persistent cache outside the watched repo (never write under repo root)."""
+    candidates: list[str] = []
+    env_dir = os.environ.get("ARTIFACT_CACHE_DIR", "").strip()
+    if env_dir:
+        candidates.append(env_dir)
+    candidates.extend(["/mount/cache/pubmed-graphrag", "/tmp/pubmed-graphrag"])
+
+    for raw in candidates:
+        root = Path(raw).resolve()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            logger.info("Using artifact cache directory: %s", root)
+            return root
+        except OSError as exc:
+            logger.warning("Cannot use artifact cache directory %s: %s", root, exc)
+
+    fallback = Path("/tmp/pubmed-graphrag").resolve()
+    fallback.mkdir(parents=True, exist_ok=True)
+    logger.info("Using fallback artifact cache directory: %s", fallback)
+    return fallback
 
 
-def _relative_key(base: Path) -> str:
-    return base.relative_to(_repo_root()).as_posix()
+def _repo_artifact_path(logical: Path | str) -> Path:
+    return (_repo_root() / _logical_relative(logical)).resolve()
 
 
-def _effective_min_size(base: Path, min_size: int = MIN_VALID_SIZE_DEFAULT) -> int:
-    return _MIN_VALID_SIZES.get(_relative_key(base), min_size)
+def _cached_artifact_path(logical: Path | str) -> Path:
+    return (_artifact_cache_root() / _logical_relative(logical)).resolve()
 
 
-def _read_ready_content(ready_path: Path) -> str | None:
-    if not ready_path.exists():
-        return None
-    try:
-        return ready_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
+def _min_valid_size(logical_key: str) -> int:
+    return _MIN_VALID_SIZES.get(logical_key, MIN_VALID_SIZE_DEFAULT)
 
 
-def _artifact_is_ready(path: Path | str, min_size: int = MIN_VALID_SIZE_DEFAULT, *, log: bool = True) -> bool:
-    """Single source of truth for artifact readiness."""
-    paths = _artifact_paths(path)
-    required_size = _effective_min_size(paths.base, min_size)
-    reason = "ok"
-    ready = False
-
-    if not paths.base.exists():
-        reason = "missing file"
-    elif not paths.base.is_file():
-        reason = "not a file"
-    else:
-        size = os.path.getsize(paths.base)
-        if size <= 0:
-            reason = "empty file"
-        elif size < required_size:
-            reason = f"size {size} < minimum {required_size}"
-        elif not paths.ready.exists():
-            reason = f"missing ready file at {paths.ready}"
-        elif _read_ready_content(paths.ready) != "ok":
-            reason = f"invalid ready content at {paths.ready}"
-        else:
-            ready = True
-
-    if log:
-        status = "TRUE" if ready else "FALSE"
-        logger.info("READY CHECK: %s → %s (%s)", paths.base, status, reason)
-        logger.info("ARTIFACT READY = %s", status)
-        print(f"READY CHECK: {paths.base} → {status}", flush=True)
-        print(f"ARTIFACT READY = {status}", flush=True)
-
-    return ready
+def _artifact_file_valid(path: Path, logical_key: str) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    size = os.path.getsize(path)
+    return size > 0 and size >= _min_valid_size(logical_key)
 
 
-def _log_skip_download(paths: _ArtifactPaths) -> None:
-    print("SKIP DOWNLOAD TRIGGERED", flush=True)
-    print("SKIP DOWNLOAD", flush=True)
-    logger.info("SKIP DOWNLOAD TRIGGERED for %s", paths.base)
-    logger.info("SKIP DOWNLOAD: artifact validated for %s", paths.base)
+def resolve_artifact_path(logical: Path | str) -> Path:
+    """Return the path to read an artifact from (cache first, then local repo copy)."""
+    logical_key = _logical_relative(logical)
+    cache_path = _cached_artifact_path(logical)
+    if _artifact_file_valid(cache_path, logical_key):
+        return cache_path
+
+    repo_path = _repo_artifact_path(logical)
+    if _artifact_file_valid(repo_path, logical_key):
+        return repo_path
+
+    return cache_path
 
 
-def _remove_invalid_artifact(paths: _ArtifactPaths) -> None:
-    """Remove corrupt or partial artifacts before a fresh download."""
-    if _artifact_is_ready(paths.base, log=False):
-        return
-    for stale in (paths.part, paths.ready, paths.base):
-        if stale.exists():
-            try:
-                stale.unlink()
-                logger.info("Removed stale artifact path: %s", stale)
-            except OSError as exc:
-                logger.warning("Failed to remove stale artifact %s: %s", stale, exc)
+def download_if_missing(url: str, logical: Path | str) -> Path:
+    """Download to the external cache directory if the artifact file is missing."""
+    logical_key = _logical_relative(logical)
+    dest = _cached_artifact_path(logical)
 
+    if _artifact_file_valid(dest, logical_key):
+        logger.info("SKIP DOWNLOAD: using cached artifact at %s", dest)
+        print("SKIP DOWNLOAD", flush=True)
+        return dest
 
-def _create_process_lock(lock_path: Path) -> None:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.write_text("downloading", encoding="utf-8")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part_path = Path(f"{dest}.part").resolve()
 
-
-def _remove_process_lock(lock_path: Path) -> None:
-    try:
-        lock_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("Failed to remove process lock %s: %s", lock_path, exc)
-
-
-def _write_ready_marker(ready_path: Path) -> None:
-    ready_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(ready_path, "w", encoding="utf-8") as handle:
-        handle.write("ok")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def download_if_missing(url: str, path: Path | str) -> Path:
-    """Download ``url`` to ``path`` when the artifact is not already ready."""
-    paths = _artifact_paths(path)
-
-    # Mandatory readiness gate — no bypass.
-    if _artifact_is_ready(paths.base):
-        _log_skip_download(paths)
-        return paths.base
-
-    # A. Peer lock wait
-    if paths.lock.exists():
-        for _ in range(LOCK_RETRY_ATTEMPTS):
-            if _artifact_is_ready(paths.base, log=False):
-                _log_skip_download(paths)
-                return paths.base
-            if not paths.lock.exists():
-                break
-            time.sleep(LOCK_RETRY_MS / 1000.0)
-        if _artifact_is_ready(paths.base, log=False):
-            _log_skip_download(paths)
-            return paths.base
-        if paths.lock.exists():
-            logger.info("Peer lock still active; skipping download for %s", paths.base)
-            return paths.base
-
-    _remove_invalid_artifact(paths)
-
-    # B. Acquire lock
-    _create_process_lock(paths.lock)
-    paths.base.parent.mkdir(parents=True, exist_ok=True)
-
-    logger.info("DOWNLOAD STARTED: %s", paths.base)
+    logger.info("DOWNLOAD STARTED: %s", dest)
     print("ARTIFACT DOWNLOAD", flush=True)
-    logger.info("ARTIFACT DOWNLOAD: fetching %s -> %s", url, paths.base)
+    logger.info("ARTIFACT DOWNLOAD: fetching %s -> %s", url, dest)
 
     try:
         response = requests.get(url, timeout=300, stream=True)
         response.raise_for_status()
 
-        # C. Download to .part
-        with open(paths.part, "wb") as handle:
+        with open(part_path, "wb") as handle:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     handle.write(chunk)
-            # D. Flush + fsync
             handle.flush()
             os.fsync(handle.fileno())
 
-        # E. Atomic replace
-        os.replace(paths.part, paths.base)
-        # F. Mark ready only after successful replace
-        _write_ready_marker(paths.ready)
-
-        logger.info("DOWNLOAD COMPLETED: %s (%d bytes)", paths.base, os.path.getsize(paths.base))
-        return paths.base
+        os.replace(part_path, dest)
+        logger.info("DOWNLOAD COMPLETED: %s (%d bytes)", dest, os.path.getsize(dest))
+        return dest
     except Exception:
-        if paths.part.exists():
+        if part_path.exists():
             try:
-                paths.part.unlink()
-            except OSError:
-                pass
-        if paths.ready.exists():
-            try:
-                paths.ready.unlink()
+                part_path.unlink()
             except OSError:
                 pass
         raise
-    finally:
-        # G. Always remove .lock
-        _remove_process_lock(paths.lock)
 
 
-def _ensure_artifact(path: Path | str) -> Path:
-    """Ensure a pipeline artifact exists locally, downloading if configured."""
-    paths = _artifact_paths(path)
+def _ensure_artifact(logical: Path | str) -> Path:
+    """Ensure artifact exists in external cache; never writes into the repo tree."""
+    logical_key = _logical_relative(logical)
+    cache_path = _cached_artifact_path(logical)
 
-    rel = _relative_key(paths.base)
-    remote_name = _ARTIFACT_REMOTE_NAMES.get(rel)
+    if _artifact_file_valid(cache_path, logical_key):
+        logger.info("SKIP DOWNLOAD: using cached artifact at %s", cache_path)
+        print("SKIP DOWNLOAD", flush=True)
+        return cache_path
+
+    repo_path = _repo_artifact_path(logical)
+    if _artifact_file_valid(repo_path, logical_key):
+        logger.info("Using existing repo artifact (read-only): %s", repo_path)
+        return repo_path
+
+    remote_name = _ARTIFACT_REMOTE_NAMES.get(logical_key)
     if remote_name is None:
-        raise FileNotFoundError(f"No remote mapping for artifact: {paths.base}")
+        raise FileNotFoundError(f"No remote mapping for artifact: {logical_key}")
 
     base_url = ARTIFACT_BASE_URL.rstrip("/")
     if base_url == "TODO_SET_THIS":
         raise FileNotFoundError(
-            f"Artifact missing: {paths.base}. Set the ARTIFACT_BASE_URL environment variable "
-            f"to a base URL hosting deployment artifacts, or generate data/ locally."
+            f"Artifact missing at {cache_path}. Set ARTIFACT_BASE_URL or place files under "
+            f"{repo_path} for local development."
         )
 
     url = f"{base_url}/{remote_name}"
-    return download_if_missing(url, paths.base)
+    return download_if_missing(url, logical)
 
 
 def _download_if_missing() -> tuple[str, ...]:
-    """Ensure all deployment artifacts exist on disk (idempotent; no Streamlit)."""
+    """Ensure all deployment artifacts exist (writes only to external cache)."""
     cfg = AppConfig.default()
     artifact = cfg.artifact
     paths = (
@@ -273,16 +191,12 @@ def _download_if_missing() -> tuple[str, ...]:
         artifact.has_chunk_path,
         artifact.entities_path,
     )
-    ensured: list[str] = []
-    for path in paths:
-        resolved = _ensure_artifact(path)
-        ensured.append(str(_artifact_paths(resolved).base))
-    return tuple(ensured)
+    return tuple(str(_ensure_artifact(path)) for path in paths)
 
 
 @lru_cache(maxsize=1)
 def ensure_deployment_artifacts() -> tuple[str, ...]:
-    """Download missing deployment artifacts once per process (file-safe)."""
+    """Download missing deployment artifacts once per process."""
     return _download_if_missing()
 
 
@@ -306,11 +220,11 @@ class ArtifactLoader:
 
         ensure_deployment_artifacts()
 
-        chunks_path = _artifact_paths(artifact.chunks_path).base
-        embeddings_path = _artifact_paths(artifact.embeddings_path).base
-        mentions_path = _artifact_paths(artifact.mentions_path).base
-        has_chunk_path = _artifact_paths(artifact.has_chunk_path).base
-        entities_path = _artifact_paths(artifact.entities_path).base
+        chunks_path = resolve_artifact_path(artifact.chunks_path)
+        embeddings_path = resolve_artifact_path(artifact.embeddings_path)
+        mentions_path = resolve_artifact_path(artifact.mentions_path)
+        has_chunk_path = resolve_artifact_path(artifact.has_chunk_path)
+        entities_path = resolve_artifact_path(artifact.entities_path)
 
         chunks = list(iter_jsonl_gz(chunks_path))
         embeddings = np.load(embeddings_path)
