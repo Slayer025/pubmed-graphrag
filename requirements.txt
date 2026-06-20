@@ -1,11 +1,10 @@
-# Streamlit Community Cloud — CPU-only demo dependencies.
-# PyTorch CPU wheels (avoids CUDA packages on Linux containers).
---extra-index-url https://download.pytorch.org/whl/cpu
-
-streamlit>=1.28.0
-numpy>=1.26.0
-pandas>=2.1.0
-scikit-learn>=1.3.0
-sentence-transformers>=2.2.0
-torch>=2.0.0
-requests>=2.31.0
+# Streamlit Community Cloud — pinned demo dependencies (Python 3.11–3.12).
+streamlit==1.58.0
+numpy>=1.26.0,<3
+pandas>=2.1.0,<3
+scikit-learn>=1.3.0,<2
+requests>=2.31,<3
+torch>=2.2.0,<2.8
+transformers>=4.41.0,<5
+sentence-transformers>=3.0.0,<6
+huggingface-hub>=0.23.0,<1

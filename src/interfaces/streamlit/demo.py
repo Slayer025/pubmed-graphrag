@@ -10,9 +10,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# Repo root (…/pubmed-graphrag), not src/.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if Path.cwd() != PROJECT_ROOT:
+    os.chdir(PROJECT_ROOT)
 
 try:
     import streamlit as st
@@ -27,6 +30,7 @@ except ImportError as exc:
 from src.application.dto.search_config import SearchConfig
 from src.bootstrap import bootstrap_pipeline, default_search_config
 from src.domain.entities.retrieval_result import RetrievalResult
+from src.infrastructure.storage.artifact_loader import ensure_deployment_artifacts
 from src.rag_pipeline import RAGPipeline
 
 logging.basicConfig(
@@ -35,20 +39,10 @@ logging.basicConfig(
 )
 
 
-def _build_search_config(base: SearchConfig, overrides: dict[str, Any]) -> SearchConfig:
-    """Build a request-scoped ``SearchConfig`` from UI overrides."""
-    return SearchConfig(
-        top_k=overrides.get("top_k", base.top_k),
-        expand_depth=overrides.get("expand_depth", base.expand_depth),
-        max_entity_degree=overrides.get("max_entity_degree", base.max_entity_degree),
-        max_expansion_per_entity=overrides.get(
-            "max_expansion_per_entity", base.max_expansion_per_entity
-        ),
-        max_expanded_nodes=overrides.get("max_expanded_nodes", base.max_expanded_nodes),
-        alpha=overrides.get("alpha", base.alpha),
-        depth_scores=base.depth_scores,
-        max_results=overrides.get("max_results", base.max_results),
-    )
+@st.cache_resource(show_spinner="Downloading deployment artifacts (once per session)...")
+def _ensure_artifacts_cached() -> tuple[str, ...]:
+    """Ensure remote artifacts exist on disk once per Streamlit session."""
+    return ensure_deployment_artifacts()
 
 
 @st.cache_resource(show_spinner="Loading PubMed GraphRAG pipeline...")
@@ -64,6 +58,22 @@ def _load_pipeline(
         use_reranker=use_reranker,
         reranker_beta=reranker_beta,
         use_decomposer=use_decomposer,
+    )
+
+
+def _build_search_config(base: SearchConfig, overrides: dict[str, Any]) -> SearchConfig:
+    """Build a request-scoped ``SearchConfig`` from UI overrides."""
+    return SearchConfig(
+        top_k=overrides.get("top_k", base.top_k),
+        expand_depth=overrides.get("expand_depth", base.expand_depth),
+        max_entity_degree=overrides.get("max_entity_degree", base.max_entity_degree),
+        max_expansion_per_entity=overrides.get(
+            "max_expansion_per_entity", base.max_expansion_per_entity
+        ),
+        max_expanded_nodes=overrides.get("max_expanded_nodes", base.max_expanded_nodes),
+        alpha=overrides.get("alpha", base.alpha),
+        depth_scores=base.depth_scores,
+        max_results=overrides.get("max_results", base.max_results),
     )
 
 
@@ -191,6 +201,7 @@ def main() -> int:
     }
 
     try:
+        _ensure_artifacts_cached()
         pipeline = _load_pipeline(
             llm_client_type=llm_client_type,
             use_reranker=use_reranker,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,25 @@ _ARTIFACT_REMOTE_NAMES: dict[str, str] = {
     "data/graph/entities.csv": "entities.csv",
     "data/graph/has_chunk.csv": "has_chunk.csv",
 }
+
+
+@lru_cache(maxsize=1)
+def ensure_deployment_artifacts() -> tuple[str, ...]:
+    """Download missing deployment artifacts once per process."""
+    cfg = AppConfig.default()
+    artifact = cfg.artifact
+    paths = (
+        artifact.chunks_path,
+        artifact.embeddings_path,
+        artifact.mentions_path,
+        artifact.has_chunk_path,
+        artifact.entities_path,
+    )
+    ensured: list[str] = []
+    for path in paths:
+        _ensure_artifact(path)
+        ensured.append(str(path.resolve()))
+    return tuple(ensured)
 
 
 def download_if_missing(url: str, path: Path) -> Path:
@@ -86,10 +106,10 @@ class ArtifactLoader:
     def load(config: AppConfig) -> LoadedArtifacts:
         artifact = config.artifact
 
-        _ensure_artifact(artifact.chunks_path)
+        ensure_deployment_artifacts()
+
         chunks = list(iter_jsonl_gz(artifact.chunks_path))
 
-        _ensure_artifact(artifact.embeddings_path)
         embeddings = np.load(artifact.embeddings_path)
 
         if embeddings.shape[0] != len(chunks):
@@ -105,9 +125,6 @@ class ArtifactLoader:
 
         embeddings = normalize_embeddings(embeddings)
 
-        _ensure_artifact(artifact.mentions_path)
-        _ensure_artifact(artifact.has_chunk_path)
-        _ensure_artifact(artifact.entities_path)
         mentions = load_csv(artifact.mentions_path, ["chunk_id", "entity_id"])
         has_chunk = load_csv(artifact.has_chunk_path, ["article_id", "chunk_id"])
         entities = load_csv(artifact.entities_path, ["entity_id", "name", "label"])

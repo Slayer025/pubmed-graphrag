@@ -36,17 +36,17 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def _load_artifacts(config: AppConfig | None = None) -> LoadedArtifacts:
+def _load_artifacts() -> LoadedArtifacts:
     """Load Phase 1/2 artifacts exactly once per process."""
-    cfg = config or AppConfig.default()
+    cfg = AppConfig.default()
     logger.info("Loading artifacts...")
     return ArtifactLoader.load(cfg)
 
 
 @lru_cache(maxsize=1)
-def _load_embedding_model(config: AppConfig | None = None) -> Any:
+def _load_embedding_model() -> Any:
     """Load the sentence-transformers model exactly once per process."""
-    cfg = config or AppConfig.default()
+    cfg = AppConfig.default()
     logger.info("Loading embedding model...")
     return create_embedding_model(cfg.embedding.model_name)
 
@@ -54,7 +54,7 @@ def _load_embedding_model(config: AppConfig | None = None) -> Any:
 def _build_embedding_service(config: AppConfig | None = None) -> SentenceTransformerEmbeddingService:
     """Build the embedding service adapter (lightweight wrapper around cached model)."""
     cfg = config or AppConfig.default()
-    model = _load_embedding_model(cfg)
+    model = _load_embedding_model()
     return SentenceTransformerEmbeddingService(
         model=model,
         batch_size=cfg.embedding.batch_size,
@@ -65,7 +65,7 @@ def _build_embedding_service(config: AppConfig | None = None) -> SentenceTransfo
 def _build_retrieve_documents(config: AppConfig | None = None) -> RetrieveDocumentsUseCase:
     """Build the main retrieval use case with cached artifacts and model."""
     cfg = config or AppConfig.default()
-    artifacts = _load_artifacts(cfg)
+    artifacts = _load_artifacts()
 
     embedding_service = _build_embedding_service(cfg)
     vector_store = NumpyVectorStore(artifacts.chunks, artifacts.embeddings)
@@ -98,7 +98,7 @@ def bootstrap_retriever(config: AppConfig | None = None) -> "Retriever":
     from src.retriever import Retriever
 
     cfg = config or AppConfig.default()
-    artifacts = _load_artifacts(cfg)
+    artifacts = _load_artifacts()
 
     # Build a legacy index shape for compatibility.
     graph_repository = InMemoryGraphRepository(

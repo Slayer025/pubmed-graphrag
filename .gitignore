@@ -15,6 +15,7 @@ Thumbs.db
 
 *.log
 
+# Large pipeline artifacts — fetched at runtime via ARTIFACT_BASE_URL / HF.
 data/
 outputs/
 
