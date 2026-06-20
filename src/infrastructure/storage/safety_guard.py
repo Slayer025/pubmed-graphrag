@@ -69,18 +69,45 @@ def safe_write_file(path: str | Path, mode: str = "wb") -> Iterator[object]:
 
 
 def configure_external_model_caches() -> None:
-    """Redirect HuggingFace, Transformers, and Torch caches outside the repo."""
-    os.environ["HF_HOME"] = _DEFAULT_HF_HOME
-    os.environ["TRANSFORMERS_CACHE"] = _DEFAULT_TRANSFORMERS_CACHE
-    os.environ["TORCH_HOME"] = _DEFAULT_TORCH_HOME
-    os.environ["HF_DATASETS_CACHE"] = str(Path(_DEFAULT_HF_HOME) / "datasets")
-    os.environ["HF_HUB_CACHE"] = str(Path(_DEFAULT_HF_HOME) / "hub")
+    """Ensure external model cache directories exist (call after configure_environment)."""
+    from src.bootstrap.environment import configure_environment
 
+    configure_environment()
     safe_mkdir(_DEFAULT_HF_HOME)
     safe_mkdir(_DEFAULT_TRANSFORMERS_CACHE)
     safe_mkdir(_DEFAULT_TORCH_HOME)
-    safe_mkdir(os.environ["HF_DATASETS_CACHE"])
-    safe_mkdir(os.environ["HF_HUB_CACHE"])
+    safe_mkdir(os.path.join(_DEFAULT_HF_HOME, "datasets"))
+    safe_mkdir(os.path.join(_DEFAULT_HF_HOME, "hub"))
+
+
+def detect_streamlit_cache_flapping(config_hash: str) -> None:
+    """Log when rerun-time state changes in ways that can invalidate Streamlit caches."""
+    import sys
+
+    snapshot = {
+        "config_hash": config_hash,
+        "HF_HOME": os.environ.get("HF_HOME"),
+        "TORCH_HOME": os.environ.get("TORCH_HOME"),
+        "TRANSFORMERS_CACHE": os.environ.get("TRANSFORMERS_CACHE"),
+        "modules_size": len(sys.modules),
+    }
+
+    previous = getattr(detect_streamlit_cache_flapping, "_previous", None)
+    if previous is not None and previous != snapshot:
+        logger.warning(
+            "STREAMLIT CACHE INVALIDATION SOURCE DETECTED: %s -> %s",
+            previous,
+            snapshot,
+        )
+    detect_streamlit_cache_flapping._previous = snapshot  # type: ignore[attr-defined]
+
+    logger.info(
+        "streamlit cache snapshot config_hash=%s HF_HOME=%s TORCH_HOME=%s modules=%d",
+        config_hash,
+        snapshot["HF_HOME"],
+        snapshot["TORCH_HOME"],
+        snapshot["modules_size"],
+    )
 
 
 def log_startup_diagnostics() -> None:

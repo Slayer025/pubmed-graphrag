@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.bootstrap.environment import configure_environment
+
+configure_environment()
 
 try:
     import streamlit as st
@@ -25,10 +30,17 @@ except ImportError as exc:
     )
     raise SystemExit(1)
 
+from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
-from src.bootstrap import bootstrap_pipeline, default_search_config
-from src.config import AppConfig
+from src.application.use_cases.generate_answer import GenerateAnswerUseCase
+from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
+from src.bootstrap import PipelineBuildConfig, build_pipeline, default_search_config
 from src.domain.entities.retrieval_result import RetrievalResult
+from src.domain.value_objects.query import Query
+from src.graph_reranker import GraphReranker
+from src.infrastructure.storage.safety_guard import detect_streamlit_cache_flapping
+from src.llm_client import create_llm_client
+from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
 
 logger = logging.getLogger(__name__)
@@ -39,22 +51,33 @@ logging.basicConfig(
 )
 
 
-@st.cache_resource(show_spinner="Loading PubMed GraphRAG pipeline...")
-def get_pipeline(
-    llm_client_type: str,
-    embedding_model_name: str,
-    use_reranker: bool,
-    reranker_beta: float,
-    use_decomposer: bool,
-) -> RAGPipeline:
-    """Bootstrap the RAG pipeline once per deterministic cache key."""
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Deterministic Streamlit cache key for the heavy retrieval stack."""
+
+    cache_dir: str = "/tmp/pubmed-graphrag"
+    hf_home: str = "/tmp/hf_cache"
+
+
+def _pipeline_config_from_process_defaults() -> PipelineConfig:
+    cache_dir = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
+    hf_home = os.environ.get("HF_HOME", "/tmp/hf_cache")
+    return PipelineConfig(cache_dir=cache_dir, hf_home=hf_home)
+
+
+PIPELINE_CONFIG = _pipeline_config_from_process_defaults()
+
+
+@st.cache_resource(show_spinner=False)
+def get_pipeline(_config: PipelineConfig) -> RAGPipeline:
+    """Bootstrap the heavy retrieval stack once per deterministic cache key."""
     print("PIPELINE INIT CALLED", flush=True)
     logger.info("PIPELINE INIT CALLED")
-    return bootstrap_pipeline(
-        llm_client_type=llm_client_type,
-        use_reranker=use_reranker,
-        reranker_beta=reranker_beta,
-        use_decomposer=use_decomposer,
+    return build_pipeline(
+        config=PipelineBuildConfig(
+            cache_dir=_config.cache_dir,
+            hf_home=_config.hf_home,
+        )
     )
 
 
@@ -72,6 +95,78 @@ def _build_search_config(base: SearchConfig, overrides: dict[str, Any]) -> Searc
         depth_scores=base.depth_scores,
         max_results=overrides.get("max_results", base.max_results),
     )
+
+
+def _maybe_rerank(
+    graph_repository: Any,
+    query: str,
+    results: list[RetrievalResult],
+    *,
+    enabled: bool,
+    beta: float,
+) -> list[RetrievalResult]:
+    if not enabled:
+        return results
+    reranker = GraphReranker(
+        index=graph_repository,
+        config=RerankConfig(enabled=True, beta=beta),
+    )
+    return reranker.rerank(query, results)
+
+
+def _retrieve_results(
+    retrieve_documents: RetrieveDocumentsUseCase,
+    graph_repository: Any,
+    query: str,
+    search_config: SearchConfig,
+    *,
+    llm_client_type: str,
+    use_reranker: bool,
+    reranker_beta: float,
+    use_decomposer: bool,
+) -> tuple[list[str], list[RetrievalResult]]:
+    if use_decomposer:
+        llm = create_llm_client(llm_client_type)
+        decomposer = QueryDecomposer(llm=llm, config=DecomposerConfig(enabled=True))
+        sub_queries = decomposer.decompose(query)
+        if len(sub_queries) <= 1:
+            results = retrieve_documents.execute(Query(query), search_config)
+            results = _maybe_rerank(
+                graph_repository,
+                query,
+                results,
+                enabled=use_reranker,
+                beta=reranker_beta,
+            )
+            return sub_queries, results
+
+        best_by_chunk: dict[str, RetrievalResult] = {}
+        for sub_query in sub_queries:
+            sub_results = retrieve_documents.execute(Query(sub_query), search_config)
+            sub_results = _maybe_rerank(
+                graph_repository,
+                sub_query,
+                sub_results,
+                enabled=use_reranker,
+                beta=reranker_beta,
+            )
+            for result in sub_results:
+                existing = best_by_chunk.get(result.chunk_id)
+                if existing is None or result.combined_score > existing.combined_score:
+                    best_by_chunk[result.chunk_id] = result
+
+        merged = sorted(best_by_chunk.values(), key=lambda r: r.combined_score, reverse=True)
+        return sub_queries, merged[: search_config.max_results]
+
+    results = retrieve_documents.execute(Query(query), search_config)
+    results = _maybe_rerank(
+        graph_repository,
+        query,
+        results,
+        enabled=use_reranker,
+        beta=reranker_beta,
+    )
+    return [query], results
 
 
 def _results_to_csv(results: list[RetrievalResult]) -> str:
@@ -149,6 +244,8 @@ def _render_graph_evidence(graph_repository: Any, results: list[RetrievalResult]
 
 
 def main() -> int:
+    detect_streamlit_cache_flapping(str(hash(PIPELINE_CONFIG)))
+
     st.set_page_config(page_title="PubMed GraphRAG Demo", layout="wide")
     st.title("🧬 PubMed GraphRAG Demo")
     st.markdown(
@@ -197,19 +294,12 @@ def main() -> int:
         "max_results": max_results,
     }
 
-    embedding_model_name = AppConfig.default().embedding.model_name
-
     try:
-        pipeline = get_pipeline(
-            llm_client_type=llm_client_type,
-            embedding_model_name=embedding_model_name,
-            use_reranker=use_reranker,
-            reranker_beta=reranker_beta,
-            use_decomposer=use_decomposer,
-        )
+        pipeline = get_pipeline(PIPELINE_CONFIG)
         base_config = default_search_config()
         search_config = _build_search_config(base_config, retrieval_overrides)
-        graph_repository = pipeline.retrieve_documents.graph_expand.graph_repository
+        retrieve_documents = pipeline.retrieve_documents
+        graph_repository = retrieve_documents.graph_expand.graph_repository
     except Exception as exc:
         st.error(f"Failed to load pipeline: {exc}")
         return 1
@@ -226,11 +316,18 @@ def main() -> int:
 
     if retrieve_clicked or answer_clicked:
         with st.spinner("Retrieving..."):
+            sub_queries, results = _retrieve_results(
+                retrieve_documents,
+                graph_repository,
+                query,
+                search_config,
+                llm_client_type=llm_client_type,
+                use_reranker=use_reranker,
+                reranker_beta=reranker_beta,
+                use_decomposer=use_decomposer,
+            )
             if use_decomposer:
-                sub_queries, results = pipeline.retrieve_decomposed(query, search_config)
                 st.write(f"Sub-queries used ({len(sub_queries)}): {sub_queries}")
-            else:
-                results = pipeline.retrieve_reranked(query, search_config)
 
         st.subheader(f"Retrieved context ({len(results)} chunks)")
         for rank, result in enumerate(results, start=1):
@@ -247,9 +344,10 @@ def main() -> int:
 
         if answer_clicked:
             with st.spinner("Generating answer..."):
-                response = pipeline.generate(query, search_config, context=results)
+                llm = create_llm_client(llm_client_type)
+                answer = GenerateAnswerUseCase(llm=llm).execute(Query(query), results)
             st.subheader("Answer")
-            st.markdown(response.answer)
+            st.markdown(answer)
 
     return 0
 

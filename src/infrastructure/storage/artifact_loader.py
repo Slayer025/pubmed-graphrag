@@ -47,6 +47,16 @@ _MIN_VALID_SIZES: dict[str, int] = {
     "data/graph/has_chunk.csv": MIN_VALID_SIZE_DEFAULT,
 }
 
+_explicit_cache_root: Path | None = None
+
+
+def set_artifact_cache_dir(cache_dir: str) -> None:
+    """Pin artifact downloads to an explicit external cache directory."""
+    global _explicit_cache_root
+    root = Path(cache_dir).resolve()
+    assert_no_repo_write(str(root))
+    _explicit_cache_root = root
+
 
 def _repo_root() -> Path:
     """Return repository root without relying on process cwd."""
@@ -60,9 +70,11 @@ def _normalize_relative(path: Path | str) -> str:
     return candidate.as_posix()
 
 
-@lru_cache(maxsize=1)
 def get_cache_dir() -> Path:
     """Return the external artifact cache root (never under the repo directory)."""
+    if _explicit_cache_root is not None:
+        return _explicit_cache_root
+
     env_dir = os.environ.get("ARTIFACT_CACHE_DIR", "").strip()
     if env_dir:
         root = Path(env_dir).resolve()
@@ -70,9 +82,6 @@ def get_cache_dir() -> Path:
         root = Path("/tmp/pubmed-graphrag").resolve()
 
     assert_no_repo_write(str(root))
-    safe_mkdir(root)
-    logger.info("CACHE_DIR=%s", root)
-    print(f"CACHE_DIR={root}", flush=True)
     return root
 
 

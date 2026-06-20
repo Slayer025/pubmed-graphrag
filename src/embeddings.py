@@ -39,21 +39,28 @@ def _configure_logging() -> None:
         )
 
 
-def create_embedding_model(model_name: str = DEFAULT_MODEL_NAME) -> Any:
+def create_embedding_model(
+    model_name: str = DEFAULT_MODEL_NAME,
+    *,
+    cache_folder: str | None = None,
+) -> Any:
     """Initialize an embedding model.
 
     Args:
         model_name: Identifier or path of the embedding model to load.
+        cache_folder: Explicit HuggingFace cache directory. When omitted, falls
+            back to ``configure_hf_home()`` for script/CLI usage.
 
     Returns:
         A loaded SentenceTransformer model instance.
     """
-    import os
-
     from sentence_transformers import SentenceTransformer
 
-    configure_hf_home()
-    cache_folder = os.environ.get("HF_HOME", "/tmp/hf_cache")
+    if cache_folder is None:
+        configure_hf_home()
+        import os
+
+        cache_folder = os.environ.get("HF_HOME", "/tmp/hf_cache")
 
     candidates: list[str] = []
     for name in (model_name, DEFAULT_MODEL_NAME, "all-MiniLM-L6-v2"):
