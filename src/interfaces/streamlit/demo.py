@@ -14,8 +14,6 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if Path.cwd() != PROJECT_ROOT:
-    os.chdir(PROJECT_ROOT)
 
 try:
     import streamlit as st
@@ -30,8 +28,9 @@ except ImportError as exc:
 from src.application.dto.search_config import SearchConfig
 from src.bootstrap import bootstrap_pipeline, default_search_config
 from src.domain.entities.retrieval_result import RetrievalResult
-from src.infrastructure.storage.artifact_loader import ensure_deployment_artifacts
 from src.rag_pipeline import RAGPipeline
+
+logger = logging.getLogger(__name__)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,20 +38,15 @@ logging.basicConfig(
 )
 
 
-@st.cache_resource(show_spinner="Downloading deployment artifacts (once per session)...")
-def _ensure_artifacts_cached() -> tuple[str, ...]:
-    """Ensure remote artifacts exist on disk once per Streamlit session."""
-    return ensure_deployment_artifacts()
-
-
 @st.cache_resource(show_spinner="Loading PubMed GraphRAG pipeline...")
-def _load_pipeline(
+def get_pipeline(
     llm_client_type: str,
     use_reranker: bool,
     reranker_beta: float,
     use_decomposer: bool,
 ) -> RAGPipeline:
-    """Bootstrap the RAG pipeline once. UI retrieval config is applied per request."""
+    """Bootstrap the RAG pipeline once per cache key (session/process)."""
+    logger.info("PIPELINE INIT (cached resource)")
     return bootstrap_pipeline(
         llm_client_type=llm_client_type,
         use_reranker=use_reranker,
@@ -200,14 +194,23 @@ def main() -> int:
         "max_results": max_results,
     }
 
+    pipeline_key = (llm_client_type, use_reranker, reranker_beta, use_decomposer)
+
     try:
-        _ensure_artifacts_cached()
-        pipeline = _load_pipeline(
-            llm_client_type=llm_client_type,
-            use_reranker=use_reranker,
-            reranker_beta=reranker_beta,
-            use_decomposer=use_decomposer,
-        )
+        if "pipeline_initialized" not in st.session_state:
+            st.session_state.pipeline_initialized = True
+            logger.info("PIPELINE INIT (session bootstrap)")
+
+        if st.session_state.get("pipeline_key") != pipeline_key:
+            st.session_state.pipeline_key = pipeline_key
+            st.session_state.pipeline = get_pipeline(
+                llm_client_type=llm_client_type,
+                use_reranker=use_reranker,
+                reranker_beta=reranker_beta,
+                use_decomposer=use_decomposer,
+            )
+
+        pipeline = st.session_state.pipeline
         base_config = default_search_config()
         search_config = _build_search_config(base_config, retrieval_overrides)
         graph_repository = pipeline.retrieve_documents.graph_expand.graph_repository

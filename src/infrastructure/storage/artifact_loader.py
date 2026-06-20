@@ -32,33 +32,28 @@ _ARTIFACT_REMOTE_NAMES: dict[str, str] = {
 }
 
 
-@lru_cache(maxsize=1)
-def ensure_deployment_artifacts() -> tuple[str, ...]:
-    """Download missing deployment artifacts once per process."""
-    cfg = AppConfig.default()
-    artifact = cfg.artifact
-    paths = (
-        artifact.chunks_path,
-        artifact.embeddings_path,
-        artifact.mentions_path,
-        artifact.has_chunk_path,
-        artifact.entities_path,
-    )
-    ensured: list[str] = []
-    for path in paths:
-        _ensure_artifact(path)
-        ensured.append(str(path.resolve()))
-    return tuple(ensured)
+def _repo_root() -> Path:
+    """Return repository root without relying on process cwd."""
+    return Path(__file__).resolve().parents[3]
+
+
+def _resolve_artifact_path(path: Path | str) -> Path:
+    """Resolve artifact paths against repo root when relative."""
+    resolved = Path(path)
+    if resolved.is_absolute():
+        return resolved
+    return _repo_root() / resolved
 
 
 def download_if_missing(url: str, path: Path) -> Path:
     """Download ``url`` to ``path`` when the file is not already present."""
-    path = Path(path)
+    path = _resolve_artifact_path(path)
     if path.exists():
         return path
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading artifact from %s to %s", url, path)
+    print("ARTIFACT DOWNLOAD", flush=True)
+    logger.info("ARTIFACT DOWNLOAD: fetching %s -> %s", url, path)
     response = requests.get(url, timeout=300)
     response.raise_for_status()
     path.write_bytes(response.content)
@@ -66,13 +61,13 @@ def download_if_missing(url: str, path: Path) -> Path:
     return path
 
 
-def _ensure_artifact(path: Path) -> Path:
+def _ensure_artifact(path: Path | str) -> Path:
     """Ensure a pipeline artifact exists locally, downloading if configured."""
-    path = Path(path)
+    path = _resolve_artifact_path(path)
     if path.exists():
         return path
 
-    rel = path.as_posix()
+    rel = path.relative_to(_repo_root()).as_posix()
     remote_name = _ARTIFACT_REMOTE_NAMES.get(rel)
     if remote_name is None:
         raise FileNotFoundError(f"No remote mapping for artifact: {path}")
@@ -86,6 +81,31 @@ def _ensure_artifact(path: Path) -> Path:
 
     url = f"{base}/{remote_name}"
     return download_if_missing(url, path)
+
+
+def _download_if_missing() -> tuple[str, ...]:
+    """Download all deployment artifacts once (pure; no Streamlit)."""
+    logger.info("Ensuring deployment artifacts are present on disk")
+    cfg = AppConfig.default()
+    artifact = cfg.artifact
+    paths = (
+        artifact.chunks_path,
+        artifact.embeddings_path,
+        artifact.mentions_path,
+        artifact.has_chunk_path,
+        artifact.entities_path,
+    )
+    ensured: list[str] = []
+    for path in paths:
+        _ensure_artifact(path)
+        ensured.append(str(_resolve_artifact_path(path).resolve()))
+    return tuple(ensured)
+
+
+@lru_cache(maxsize=1)
+def ensure_deployment_artifacts() -> tuple[str, ...]:
+    """Download missing deployment artifacts once per process."""
+    return _download_if_missing()
 
 
 @dataclass(frozen=True)
@@ -108,9 +128,14 @@ class ArtifactLoader:
 
         ensure_deployment_artifacts()
 
-        chunks = list(iter_jsonl_gz(artifact.chunks_path))
+        chunks_path = _resolve_artifact_path(artifact.chunks_path)
+        embeddings_path = _resolve_artifact_path(artifact.embeddings_path)
+        mentions_path = _resolve_artifact_path(artifact.mentions_path)
+        has_chunk_path = _resolve_artifact_path(artifact.has_chunk_path)
+        entities_path = _resolve_artifact_path(artifact.entities_path)
 
-        embeddings = np.load(artifact.embeddings_path)
+        chunks = list(iter_jsonl_gz(chunks_path))
+        embeddings = np.load(embeddings_path)
 
         if embeddings.shape[0] != len(chunks):
             raise ValueError(
@@ -125,9 +150,9 @@ class ArtifactLoader:
 
         embeddings = normalize_embeddings(embeddings)
 
-        mentions = load_csv(artifact.mentions_path, ["chunk_id", "entity_id"])
-        has_chunk = load_csv(artifact.has_chunk_path, ["article_id", "chunk_id"])
-        entities = load_csv(artifact.entities_path, ["entity_id", "name", "label"])
+        mentions = load_csv(mentions_path, ["chunk_id", "entity_id"])
+        has_chunk = load_csv(has_chunk_path, ["article_id", "chunk_id"])
+        entities = load_csv(entities_path, ["entity_id", "name", "label"])
 
         ArtifactLoader._validate_mentions(chunks, mentions)
 
