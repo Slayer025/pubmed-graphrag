@@ -2,16 +2,70 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import requests
 
 from src.config import AppConfig
 from src.embeddings import normalize_embeddings
 from src.infrastructure.storage.csv_loader import load_csv
 from src.storage import iter_jsonl_gz
+
+logger = logging.getLogger(__name__)
+
+# Base URL for Streamlit Cloud / fresh-container bootstrap.
+# Override via ARTIFACT_BASE_URL env var (no trailing slash required).
+ARTIFACT_BASE_URL = os.environ.get("ARTIFACT_BASE_URL", "TODO_SET_THIS")
+
+_ARTIFACT_REMOTE_NAMES: dict[str, str] = {
+    "data/chunks/chunks_semantic.jsonl.gz": "chunks_semantic.jsonl.gz",
+    "data/embeddings/semantic_embeddings.npy": "semantic_embeddings.npy",
+    "data/graph/mentions.csv": "mentions.csv",
+    "data/graph/entities.csv": "entities.csv",
+    "data/graph/has_chunk.csv": "has_chunk.csv",
+}
+
+
+def download_if_missing(url: str, path: Path) -> Path:
+    """Download ``url`` to ``path`` when the file is not already present."""
+    path = Path(path)
+    if path.exists():
+        return path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading artifact from %s to %s", url, path)
+    response = requests.get(url, timeout=300)
+    response.raise_for_status()
+    path.write_bytes(response.content)
+    logger.info("Downloaded %s (%d bytes)", path, path.stat().st_size)
+    return path
+
+
+def _ensure_artifact(path: Path) -> Path:
+    """Ensure a pipeline artifact exists locally, downloading if configured."""
+    path = Path(path)
+    if path.exists():
+        return path
+
+    rel = path.as_posix()
+    remote_name = _ARTIFACT_REMOTE_NAMES.get(rel)
+    if remote_name is None:
+        raise FileNotFoundError(f"No remote mapping for artifact: {path}")
+
+    base = ARTIFACT_BASE_URL.rstrip("/")
+    if base == "TODO_SET_THIS":
+        raise FileNotFoundError(
+            f"Artifact missing: {path}. Set the ARTIFACT_BASE_URL environment variable "
+            f"to a base URL hosting deployment artifacts, or generate data/ locally."
+        )
+
+    url = f"{base}/{remote_name}"
+    return download_if_missing(url, path)
 
 
 @dataclass(frozen=True)
@@ -32,7 +86,10 @@ class ArtifactLoader:
     def load(config: AppConfig) -> LoadedArtifacts:
         artifact = config.artifact
 
+        _ensure_artifact(artifact.chunks_path)
         chunks = list(iter_jsonl_gz(artifact.chunks_path))
+
+        _ensure_artifact(artifact.embeddings_path)
         embeddings = np.load(artifact.embeddings_path)
 
         if embeddings.shape[0] != len(chunks):
@@ -48,6 +105,9 @@ class ArtifactLoader:
 
         embeddings = normalize_embeddings(embeddings)
 
+        _ensure_artifact(artifact.mentions_path)
+        _ensure_artifact(artifact.has_chunk_path)
+        _ensure_artifact(artifact.entities_path)
         mentions = load_csv(artifact.mentions_path, ["chunk_id", "entity_id"])
         has_chunk = load_csv(artifact.has_chunk_path, ["article_id", "chunk_id"])
         entities = load_csv(artifact.entities_path, ["entity_id", "name", "label"])

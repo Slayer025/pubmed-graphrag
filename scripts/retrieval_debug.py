@@ -19,10 +19,14 @@ from pathlib import Path
 
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.bootstrap import bootstrap_pipeline
 from src.config import AppConfig
-from src.retriever import Retriever, create_retriever
-from src.rag_pipeline import create_rag_pipeline
 from src.domain.entities.retrieval_result import RetrievalResult
+from src.retriever import create_retriever
 
 
 def _configure_logging(level: int = logging.INFO) -> None:
@@ -155,9 +159,8 @@ def main() -> int:
 
         if args.generate:
             from src.llm_client import MockLLMClient
-            from src.rag_pipeline import RAGPipeline
 
-            pipeline = RAGPipeline(retriever=retriever, llm=MockLLMClient())
+            pipeline = bootstrap_pipeline(config, llm=MockLLMClient())
             print("\n" + "=" * 80)
             print("Mock generation:\n")
             response = pipeline.generate(query_text, context=results)
@@ -166,13 +169,14 @@ def main() -> int:
         return 0
 
     # Standard path: embed the query string and retrieve.
-    pipeline = create_rag_pipeline(config)
-    # create_rag_pipeline now returns a clean-architecture pipeline that requires
-    # an explicit config. Retrieve the default config from the AppConfig.
+    pipeline = bootstrap_pipeline(config)
     results = pipeline.retrieve(args.query, config.retrieval)
     _print_results(args.query, results)
 
     if args.generate:
+        from src.llm_client import MockLLMClient
+
+        pipeline = bootstrap_pipeline(config, llm=MockLLMClient())
         print("\n" + "=" * 80)
         print("Mock generation:\n")
         response = pipeline.generate(args.query, config.retrieval, context=results)

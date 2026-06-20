@@ -133,8 +133,12 @@ class Retriever:
         query_text: str = "",
     ) -> list[RetrievalResult]:
         """Legacy entry point: retrieve by pre-computed vector (deprecated)."""
-        query = query_text or ""
-        return self.retrieve(query, retrieval_config)
+        del query_text
+        config = SearchConfig.from_retrieval_config(
+            retrieval_config if retrieval_config is not None else self.retrieval
+        )
+        use_case = self._get_retrieve_documents()
+        return use_case.retrieve_by_vector(query_vector, config)
 
 
 def create_retriever(config: AppConfig | None = None) -> Retriever:

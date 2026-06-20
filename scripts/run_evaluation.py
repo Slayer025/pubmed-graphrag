@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
+from src.bootstrap import bootstrap_pipeline
 from src.config import AppConfig
 from src.evaluation import (
     build_vector_only_config,
@@ -167,16 +168,16 @@ def _build_generation_records(
     questions: list[dict[str, Any]],
     pipeline: RAGPipeline,
     graph_results: list[Any],
+    chunk_by_id: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Generate answers for each question using the GraphRAG top-10 context."""
-    index = pipeline.retriever.index
     generation_records: list[dict[str, Any]] = []
 
     for question_record, retrieval_record in zip(questions, graph_results):
         question = question_record["question"]
         context: list[Any] = []
         for chunk_id in retrieval_record.retrieved_chunks[:10]:
-            chunk = index.chunk_by_id.get(chunk_id)
+            chunk = chunk_by_id.get(chunk_id)
             if chunk is None:
                 continue
             # Build a minimal context object compatible with RAGPipeline._build_prompt.
@@ -327,9 +328,12 @@ def main() -> int:
 
     # Generation evaluation.
     llm = create_llm_client(args.llm_client)
-    pipeline = RAGPipeline(retriever=graph_retriever, llm=llm)
+    pipeline = bootstrap_pipeline(base_config, llm=llm)
     generation_records = _build_generation_records(
-        questions, pipeline, graph_per_question
+        questions,
+        pipeline,
+        graph_per_question,
+        graph_retriever.index.chunk_by_id,
     )
 
     gen_metrics, gen_per_question = evaluate_generation(
