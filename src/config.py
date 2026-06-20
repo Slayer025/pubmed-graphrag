@@ -77,6 +77,23 @@ class RetrievalConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    """Optional graph re-ranking configuration."""
+
+    enabled: bool = False
+    beta: float = 0.7
+    use_pagerank: bool = False
+
+
+@dataclass(frozen=True)
+class DecomposerConfig:
+    """Optional query decomposition configuration."""
+
+    enabled: bool = False
+    max_sub_queries: int = 4
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application configuration."""
 
@@ -84,6 +101,8 @@ class AppConfig:
     embedding: EmbeddingConfig
     artifact: ArtifactConfig
     retrieval: RetrievalConfig
+    rerank: RerankConfig = RerankConfig()
+    decomposer: DecomposerConfig = DecomposerConfig()
 
     @classmethod
     def default(cls) -> "AppConfig":
@@ -92,4 +111,6 @@ class AppConfig:
             embedding=EmbeddingConfig(),
             artifact=ArtifactConfig(),
             retrieval=RetrievalConfig(),
+            rerank=RerankConfig(),
+            decomposer=DecomposerConfig(),
         )

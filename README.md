@@ -12,7 +12,7 @@ This project builds a **GraphRAG** pipeline over PubMed scientific abstracts. Th
 - **Evaluation** — measure retrieval quality and answer faithfulness
 - **Demo application** — interactive query interface over the graph
 
-**Phase 1 (complete)** covers data loading, chunking, embedding, and visualization. **Phase 2 (complete)** covers entity extraction and Neo4j-importable graph export. **Phase 3 (complete)** implements graph-enhanced retrieval using offline artifacts. Phases 4–5 remain planned.
+**Phase 1 (complete)** covers data loading, chunking, embedding, and visualization. **Phase 2 (complete)** covers entity extraction and Neo4j-importable graph export. **Phase 3 (complete)** implements graph-enhanced retrieval using offline artifacts. **Phase 4 (complete)** adds LLM generation and evaluation over PubMedQA. **Phase 5 (complete)** adds an LLM-driven query decomposer, a graph-signal reranker, and a lightweight Streamlit demo.
 
 ## Environment
 
@@ -311,7 +311,51 @@ Notes:
 
 ### Phase 5 — Demo application
 
-**Status:** Not started
+**Status:** Complete
+
+- [x] LLM-driven query decomposition (`src/query_decomposer.py`)
+- [x] Graph-signal re-ranking (`src/graph_reranker.py`)
+- [x] Optional Neo4j GDS PageRank integration
+- [x] Streamlit demo (`scripts/demo.py`)
+
+**New components:**
+
+| File | Purpose |
+|---|---|
+| `src/query_decomposer.py` | Decompose complex questions into LLM-generated sub-questions; falls back to the original query on failure. |
+| `src/graph_reranker.py` | Re-rank `RetrievalResult` lists using graph connectivity signals (shared entities, connected chunks, inverse entity degree). Optional Neo4j GDS PageRank when a graph is loaded. |
+| `scripts/demo.py` | Lightweight Streamlit UI for interactive retrieval and answer generation. |
+| `tests/test_query_decomposer.py` | Unit tests for decomposition parsing and fallback behavior. |
+| `tests/test_graph_reranker.py` | Unit tests for graph re-ranking signals. |
+
+**Notes:**
+- Query decomposition and graph re-ranking are **opt-in** and default to disabled.
+- `src.retriever` and `src.evaluation` are unchanged; all existing Phase 4 commands still work.
+- The graph reranker is a post-processor on `RetrievalResult` lists and does not replace the retriever's built-in scoring.
+
+## Phase 5 — Demo
+
+Start the Streamlit demo after installing Phase 5 dependencies:
+
+```bash
+cd /mnt/d/pubmed-graphrag
+source .venv/bin/activate
+pip install -r requirements.txt
+
+export OPENAI_API_KEY=sk-...      # optional, for OpenAI generation/decomposition
+export LLM_MODEL=gpt-3.5-turbo    # optional
+export OLLAMA_URL=http://localhost:11434  # optional, for Ollama
+
+streamlit run scripts/demo.py
+```
+
+The demo runs locally in a browser and supports:
+
+* Mock, OpenAI, and Ollama LLM clients
+* Adjustable retrieval parameters (`top_k`, `expand_depth`, `alpha`, `max_results`)
+* Optional LLM-driven query decomposition
+* Optional graph-signal re-ranking
+* Optional Neo4j GDS PageRank (requires a running Neo4j graph named `pubmed-graph`)
 
 ## Commands
 
@@ -511,11 +555,13 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 
 ## Limitations
 
-- **Phase 3 is retrieval-only.** `src/rag_pipeline.py` provides a mock LLM client; real generation requires integrating an OpenAI/Ollama-compatible client.
+- **Phase 5 is a demo layer.** `src/rag_pipeline.py` now supports optional query decomposition and graph re-ranking, but both default to disabled. The core retrieval and evaluation logic is unchanged.
 - **No Neo4j vector index is used.** Embeddings are loaded from `data/embeddings/semantic_embeddings.npy` and searched with NumPy. Neo4j integration remains optional for future phases.
 - **Cold-start latency.** The first string query incurs the cost of importing PyTorch/sentence-transformers and loading the model from disk. On the reference WSL2 machine this can take 2–4 minutes. Subsequent queries in the same process are fast (~0.5–1 s retrieval time).
 - **Graph expansion is bounded but can still add thousands of candidates.** Use `max_entity_degree` and `max_expanded_nodes` to tune recall/latency trade-offs.
 - **No SEMANTIC_SIMILAR edges were added.** Expansion uses only `HAS_CHUNK` and `MENTIONS` relationships from Phase 2.
+- **Query decomposition requires a working LLM.** The deterministic fallback returns the original query if the LLM fails.
+- **Graph reranker PageRank requires Neo4j GDS.** Without it, the reranker falls back to offline connectivity heuristics.
 
 ## Next Steps
 
@@ -524,7 +570,7 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 3. **Graph-enhanced retrieval** — hybrid vector + graph traversal
 4. **LLM integration** — grounded answer generation
 5. **Evaluation** — retrieval metrics, faithfulness benchmarks
-6. **Demo** — query UI over the graph
+6. **Demo** — query UI over the graph ✅ completed with Streamlit
 
 ## Constraints
 
@@ -537,7 +583,7 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 
 ## Handoff Notes
 
-**Current state:** Phases 0–4 are complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, a cluster visualization, a Neo4j-importable graph export (137k entities, 258k mentions) generated offline, an offline graph-enhanced retriever, and a full Phase 4 evaluation harness over PubMedQA.
+**Current state:** Phases 0–5 are complete. The project has a 5000-abstract working set, three chunk strategies persisted as gzip JSONL, L2-normalized semantic embeddings, a cluster visualization, a Neo4j-importable graph export (137k entities, 258k mentions) generated offline, an offline graph-enhanced retriever, a full Phase 4 evaluation harness over PubMedQA, and a lightweight Streamlit demo with optional LLM-driven query decomposition and graph-signal re-ranking.
 
 **Completed source files:**
 
@@ -553,7 +599,7 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 - `src/create_graph.py` — Phase 2 orchestrator
 - `src/config.py` — central configuration
 - `src/retriever.py` — graph-enhanced retriever
-- `src/rag_pipeline.py` — RAG pipeline scaffold with mock generation
+- `src/rag_pipeline.py` — RAG pipeline with optional decomposition and graph re-ranking
 - `scripts/retrieval_debug.py` — manual retrieval test
 - `src/eval_dataset.py` — PubMedQA evaluation dataset builder
 - `src/evaluation.py` — retrieval metrics and comparison
@@ -561,6 +607,11 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 - `src/generation_eval.py` — ROUGE-L and BERTScore evaluation
 - `scripts/run_evaluation.py` — end-to-end Phase 4 runner
 - `notebooks/phase4_evaluation.ipynb` — evaluation summary notebook
+- `src/query_decomposer.py` — LLM-driven query decomposition
+- `src/graph_reranker.py` — graph-signal re-ranking
+- `scripts/demo.py` — Streamlit demo application
+- `tests/test_query_decomposer.py` — decomposition unit tests
+- `tests/test_graph_reranker.py` — reranker unit tests
 
 **Generated artifacts:** See [Data Artifacts](#data-artifacts) above, plus:
 
@@ -572,9 +623,9 @@ No Neo4j server is required to generate the CSV files — `create_graph.py` prod
 - `outputs/generation_results.csv` — per-question generation metrics
 - `outputs/evaluation_summary.json` — combined retrieval + generation summary
 
-**Next implementation target:** Phase 5 — interactive demo application. Consider:
-1. A lightweight web UI (Streamlit/Gradio/FastAPI) over the RAG pipeline.
-2. Optional Neo4j-backed retrieval mode.
-3. User-facing explanation of graph expansion evidence.
+**Next implementation target:** All requested phases are complete. Future work could include:
+1. A richer graph visualization in the demo (e.g., `pyvis` subgraph rendering).
+2. Faithfulness evaluation for generated answers.
+3. Neo4j-backed retrieval mode (currently optional and not required).
 
 **Do not yet:** redesign the retrieval architecture, add SEMANTIC_SIMILAR edges, or migrate entity extraction to SciSpaCy unless explicitly requested.
