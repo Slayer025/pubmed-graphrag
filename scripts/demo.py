@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -15,11 +17,17 @@ from src.bootstrap.environment import configure_environment
 
 configure_environment()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
 CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-graphrag"
 
 from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts
 
-bootstrap_artifacts(CACHE_DIR)
+bootstrap_status = bootstrap_artifacts(CACHE_DIR)
+print(f"ARTIFACT BOOTSTRAP STATUS: {json.dumps(bootstrap_status)}", flush=True)
 
 from src.interfaces.streamlit.demo import main
 
