@@ -27,6 +27,7 @@ except ImportError as exc:
 
 from src.application.dto.search_config import SearchConfig
 from src.bootstrap import bootstrap_pipeline, default_search_config
+from src.config import AppConfig
 from src.domain.entities.retrieval_result import RetrievalResult
 from src.rag_pipeline import RAGPipeline
 
@@ -41,12 +42,14 @@ logging.basicConfig(
 @st.cache_resource(show_spinner="Loading PubMed GraphRAG pipeline...")
 def get_pipeline(
     llm_client_type: str,
+    embedding_model_name: str,
     use_reranker: bool,
     reranker_beta: float,
     use_decomposer: bool,
 ) -> RAGPipeline:
-    """Bootstrap the RAG pipeline once per cache key (session/process)."""
-    logger.info("PIPELINE INIT (cached resource)")
+    """Bootstrap the RAG pipeline once per deterministic cache key."""
+    print("PIPELINE CREATED (actual execution)", flush=True)
+    logger.info("PIPELINE CREATED (actual execution)")
     return bootstrap_pipeline(
         llm_client_type=llm_client_type,
         use_reranker=use_reranker,
@@ -194,17 +197,27 @@ def main() -> int:
         "max_results": max_results,
     }
 
-    pipeline_key = (llm_client_type, use_reranker, reranker_beta, use_decomposer)
+    embedding_model_name = AppConfig.default().embedding.model_name
+    pipeline_key = (
+        llm_client_type,
+        embedding_model_name,
+        use_reranker,
+        reranker_beta,
+        use_decomposer,
+    )
 
     try:
         if "pipeline_initialized" not in st.session_state:
             st.session_state.pipeline_initialized = True
-            logger.info("PIPELINE INIT (session bootstrap)")
 
-        if st.session_state.get("pipeline_key") != pipeline_key:
+        if (
+            st.session_state.get("pipeline_key") != pipeline_key
+            or "pipeline" not in st.session_state
+        ):
             st.session_state.pipeline_key = pipeline_key
             st.session_state.pipeline = get_pipeline(
                 llm_client_type=llm_client_type,
+                embedding_model_name=embedding_model_name,
                 use_reranker=use_reranker,
                 reranker_beta=reranker_beta,
                 use_decomposer=use_decomposer,
