@@ -161,13 +161,19 @@ def embed_texts(
     if not texts:
         return np.empty((0, DEFAULT_EMBEDDING_DIM), dtype=np.float32)
 
+    import numpy as np
+
+    assert np is not None
     logger.info("Encoding %d texts in batches of %d", len(texts), batch_size)
-    vectors = model.encode(
-        texts,
-        batch_size=batch_size,
-        convert_to_numpy=True,
-        show_progress_bar=True,
-    )
+    try:
+        vectors = model.encode(
+            texts,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Embedding failure (likely numpy/torch mismatch): {exc}") from exc
     return np.asarray(vectors, dtype=np.float32)
 
 

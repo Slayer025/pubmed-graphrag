@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from src.embeddings import embed_texts, normalize_embeddings
 
 
@@ -19,6 +21,7 @@ class SentenceTransformerEmbeddingService:
         """Return embeddings as plain Python lists."""
         if not texts:
             return []
+        assert np is not None
         vectors = embed_texts(texts, self.model, batch_size=self.batch_size)
         if self.normalize:
             vectors = normalize_embeddings(vectors)
