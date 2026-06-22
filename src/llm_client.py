@@ -52,9 +52,6 @@ class LLMClientResult:
     mode: str
 
 
-_MOCK_KEYWORDS = frozenset(
-    {"risk", "factor", "factors", "associated", "includes", "linked", "related"}
-)
 _MOCK_STOPWORDS = frozenset(
     {
         "a",
@@ -92,6 +89,7 @@ _CHUNK_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_MOCK_MODE_LABEL = "MODE: RETRIEVAL-ONLY (NO LLM REASONING)"
 
 
 def _question_terms(question: str) -> set[str]:
@@ -136,83 +134,78 @@ def _parse_answer_prompt(prompt: str) -> tuple[str, list[tuple[str, float, str]]
     return question_match.group(1).strip(), chunks
 
 
-def _score_sentence(sentence: str, question_words: set[str]) -> int:
-    lower = sentence.lower()
-    score = sum(1 for keyword in _MOCK_KEYWORDS if keyword in lower)
-    sentence_words = set(re.findall(r"[a-z]{3,}", lower))
-    score += len(sentence_words & question_words)
-    return score
+def _lexical_overlap(sentence: str, question_words: set[str]) -> int:
+    sentence_words = set(re.findall(r"[a-z]{3,}", sentence.lower()))
+    return len(sentence_words & question_words)
+
+
+def _extract_chunk_sentences(text: str, question: str, *, max_sentences: int = 2) -> list[str]:
+    """Pick 1-2 sentences from a chunk using lexical overlap (deterministic)."""
+    sentences = [" ".join(sentence.split()) for sentence in _split_sentences(text) if sentence.strip()]
+    if not sentences:
+        return []
+
+    question_words = _question_terms(question)
+    if not question_words:
+        return sentences[:1]
+
+    ranked = [
+        (_lexical_overlap(sentence, question_words), index, sentence)
+        for index, sentence in enumerate(sentences)
+    ]
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+
+    if ranked[0][0] == 0:
+        return [ranked[0][2]]
+
+    best_overlap = ranked[0][0]
+    selected: list[str] = []
+    for overlap, _, sentence in ranked:
+        if overlap < best_overlap and selected:
+            break
+        selected.append(sentence)
+        if len(selected) >= max_sentences:
+            break
+    return selected
+
+
+def _select_top_chunks(chunks: list[tuple[str, float, str]]) -> list[tuple[str, float, str]]:
+    """Select top 3-5 chunks by retrieval ``combined_score`` (deterministic)."""
+    if not chunks:
+        return []
+    limit = min(5, len(chunks))
+    if len(chunks) >= 3:
+        limit = max(3, limit)
+    return sorted(chunks, key=lambda item: (-item[1], item[0]))[:limit]
 
 
 def _build_extractive_answer(question: str, chunks: list[tuple[str, float, str]]) -> str:
-    """Build a grounded extractive answer from top-scoring retrieved chunks."""
-    question_words = _question_terms(question)
-    ranked_chunks = sorted(chunks, key=lambda item: item[1], reverse=True)[:5]
-
-    selected_sentences: list[tuple[int, str, str]] = []
-    for chunk_id, chunk_score, text in ranked_chunks:
-        for sentence in _split_sentences(text):
-            normalized = " ".join(sentence.split())
-            if len(normalized) < 40:
-                continue
-            lower = normalized.lower()
-            has_keyword = any(keyword in lower for keyword in _MOCK_KEYWORDS)
-            sentence_words = set(re.findall(r"[a-z]{3,}", lower))
-            has_overlap = bool(sentence_words & question_words)
-            if not has_keyword and not has_overlap:
-                continue
-            sentence_score = _score_sentence(normalized, question_words)
-            selected_sentences.append((sentence_score + int(chunk_score * 10), normalized, chunk_id))
-
-    selected_sentences.sort(key=lambda item: item[0], reverse=True)
+    """Build a retrieval-only extractive answer from top-ranked chunks."""
+    ranked_chunks = _select_top_chunks(chunks)
 
     bullets: list[str] = []
     source_ids: list[str] = []
-    seen: set[str] = set()
-    for _, sentence, chunk_id in selected_sentences:
-        key = sentence.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        bullets.append(sentence)
-        if chunk_id not in source_ids:
-            source_ids.append(chunk_id)
-        if len(bullets) >= 6:
-            break
-
-    if len(bullets) < 3:
-        for chunk_id, _, text in ranked_chunks:
-            for sentence in _split_sentences(text):
-                normalized = " ".join(sentence.split())
-                if len(normalized) < 20:
-                    continue
-                key = normalized.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                bullets.append(normalized)
-                if chunk_id not in source_ids:
-                    source_ids.append(chunk_id)
-                if len(bullets) >= 3:
-                    break
-            if len(bullets) >= 3:
-                break
+    for chunk_id, _, text in ranked_chunks:
+        for sentence in _extract_chunk_sentences(text, question, max_sentences=2):
+            bullets.append(sentence)
+        source_ids.append(chunk_id)
 
     if not bullets:
+        fallback_sources = "\n".join(f"- {chunk_id}" for chunk_id, _, _ in ranked_chunks)
         return (
+            f"{_MOCK_MODE_LABEL}\n\n"
             "Answer:\n"
             "- No extractive summary could be built from the retrieved context.\n\n"
-            "Sources:\n"
-            + "\n".join(f"- {chunk_id}" for chunk_id, _, _ in ranked_chunks[:3])
+            f"Sources:\n{fallback_sources}"
         )
 
-    answer_lines = "\n".join(f"- {bullet}" for bullet in bullets[:6])
-    source_lines = "\n".join(f"- {chunk_id}" for chunk_id in source_ids[:5])
-    return f"Answer:\n{answer_lines}\n\nSources:\n{source_lines}"
+    answer_lines = "\n".join(f"- {bullet}" for bullet in bullets)
+    source_lines = "\n".join(f"- {chunk_id}" for chunk_id in source_ids)
+    return f"{_MOCK_MODE_LABEL}\n\nAnswer:\n{answer_lines}\n\nSources:\n{source_lines}"
 
 
 class MockLLMClient:
-    """Offline extractive QA mock that summarizes retrieved context only."""
+    """Retrieval-only extractive QA mock (no generative reasoning)."""
 
     def __init__(self, max_chars: int = 500) -> None:
         self.max_chars = max_chars
