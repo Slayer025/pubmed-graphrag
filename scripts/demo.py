@@ -26,7 +26,12 @@ CACHE_DIR = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or "/tmp/pubmed-gra
 
 from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts
 
-bootstrap_status = bootstrap_artifacts(CACHE_DIR)
+try:
+    bootstrap_status = bootstrap_artifacts(CACHE_DIR)
+except RuntimeError as exc:
+    print(f"ARTIFACT BOOTSTRAP FAILED: {exc}", flush=True)
+    raise SystemExit(1) from exc
+
 print(f"ARTIFACT BOOTSTRAP STATUS: {json.dumps(bootstrap_status)}", flush=True)
 
 from src.interfaces.streamlit.demo import main

@@ -38,11 +38,21 @@ class ArtifactLoader:
 
     @staticmethod
     def load(config: AppConfig) -> LoadedArtifacts:
-        """Load artifacts after bootstrap download phase (CLI/scripts)."""
-        from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts, default_cache_dir, get_preloaded_artifacts
+        """Return preloaded artifacts; never download during runtime."""
+        del config
+        from src.bootstrap.bootstrap_artifacts import (
+            get_preloaded_artifacts,
+            is_bootstrap_successful,
+            is_streamlit_runtime,
+        )
 
-        bootstrap_artifacts(default_cache_dir())
-        return get_preloaded_artifacts()
+        if is_streamlit_runtime() or is_bootstrap_successful():
+            return get_preloaded_artifacts()
+
+        raise RuntimeError(
+            "ArtifactLoader.load() cannot download artifacts at runtime. "
+            "Call bootstrap_artifacts() at process start before building the pipeline."
+        )
 
     @staticmethod
     def load_from_paths(

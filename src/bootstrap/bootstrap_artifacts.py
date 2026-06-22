@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, TypedDict
+from typing import TYPE_CHECKING, Iterator, TypedDict
 
 import requests
 
@@ -31,12 +33,13 @@ ARTIFACT_BASE_URL = os.environ.get("ARTIFACT_BASE_URL", "TODO_SET_THIS")
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503})
 _RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
-_ARTIFACT_LOGICAL_PATHS: tuple[str, ...] = (
+# Order matches artifact_paths() and ArtifactLoader.load_from_paths().
+_CACHE_LOGICAL_PATHS: tuple[str, ...] = (
     "data/chunks/chunks_semantic.jsonl.gz",
     "data/embeddings/semantic_embeddings.npy",
     "data/graph/mentions.csv",
-    "data/graph/entities.csv",
     "data/graph/has_chunk.csv",
+    "data/graph/entities.csv",
 )
 
 _ARTIFACT_REMOTE_NAMES: dict[str, str] = {
@@ -60,6 +63,8 @@ _bootstrap_complete = False
 _downloading_allowed = False
 _preloaded_artifacts: "LoadedArtifacts | None" = None
 _last_bootstrap_status: "BootstrapStatus | None" = None
+_download_locks: dict[str, threading.Lock] = {}
+_download_locks_guard = threading.Lock()
 
 
 class BootstrapStatus(TypedDict):
@@ -85,6 +90,21 @@ def is_bootstrap_complete() -> bool:
 
 def get_last_bootstrap_status() -> BootstrapStatus | None:
     return _last_bootstrap_status
+
+
+def is_bootstrap_successful() -> bool:
+    """Return True only when bootstrap completed with all required artifacts."""
+    return _last_bootstrap_status is not None and _last_bootstrap_status["success"]
+
+
+def require_bootstrap_success() -> None:
+    """Fail fast when artifact bootstrap did not complete successfully."""
+    if not is_bootstrap_successful():
+        status = _last_bootstrap_status or _empty_status()
+        raise RuntimeError(
+            "Artifact bootstrap failed; pipeline cannot be built. "
+            f"missing={status['missing']}, failed={status['failed']}"
+        )
 
 
 @contextmanager
@@ -139,12 +159,71 @@ def _artifact_file_valid(path: Path, logical_key: str) -> bool:
     return os.path.getsize(path) >= _MIN_VALID_SIZES.get(logical_key, MIN_VALID_SIZE_DEFAULT)
 
 
-def _use_stale_or_fail(dest: Path) -> bool:
-    if _cache_hit(dest):
+def _download_lock(dest: Path) -> threading.Lock:
+    key = str(dest.resolve())
+    with _download_locks_guard:
+        if key not in _download_locks:
+            _download_locks[key] = threading.Lock()
+        return _download_locks[key]
+
+
+def _use_stale_or_fail(dest: Path, logical_key: str) -> bool:
+    if _artifact_file_valid(dest, logical_key):
         logger.info("USING STALE LOCAL ARTIFACT: %s", dest)
         return True
     logger.error("Artifact unavailable and no local cache: %s", dest)
     return False
+
+
+def _materialize_to_cache(source: Path, cache_path: Path, logical_key: str) -> bool:
+    """Copy a read-only repo artifact into the external cache directory."""
+    if _artifact_file_valid(cache_path, logical_key):
+        return True
+    safe_mkdir(cache_path.parent)
+    try:
+        shutil.copy2(source, cache_path)
+    except OSError as exc:
+        logger.error("Failed to copy artifact into cache %s: %s", cache_path, exc)
+        return False
+    return _artifact_file_valid(cache_path, logical_key)
+
+
+def _remove_part_file(part_path: Path) -> None:
+    if part_path.exists():
+        try:
+            part_path.unlink()
+        except OSError:
+            pass
+
+
+def _finalize_part_download(part_path: Path, dest: Path, logical_key: str) -> bool:
+    """Atomically promote a completed .part file to the final artifact path."""
+    if _artifact_file_valid(dest, logical_key):
+        _remove_part_file(part_path)
+        return True
+    if not part_path.is_file():
+        logger.warning("Cannot finalize download; part file missing: %s", part_path)
+        return False
+    if os.path.getsize(part_path) == 0:
+        logger.error("Cannot finalize download; part file is empty: %s", part_path)
+        _remove_part_file(part_path)
+        return False
+    try:
+        assert_no_repo_write(str(dest))
+        os.replace(part_path, dest)
+    except FileNotFoundError:
+        if _artifact_file_valid(dest, logical_key):
+            return True
+        logger.warning("Finalize skipped; part file disappeared before replace: %s", part_path)
+        return False
+    except OSError as exc:
+        if _artifact_file_valid(dest, logical_key):
+            _remove_part_file(part_path)
+            return True
+        logger.error("Failed to finalize artifact download %s: %s", dest, exc)
+        _remove_part_file(part_path)
+        return False
+    return _artifact_file_valid(dest, logical_key)
 
 
 def _write_response_to_part(response: requests.Response, part_path: Path) -> bool:
@@ -166,97 +245,91 @@ def _write_response_to_part(response: requests.Response, part_path: Path) -> boo
     return True
 
 
-def _download_if_missing(url: str, dest: Path) -> bool:
+def _download_if_missing(url: str, dest: Path, logical_key: str) -> bool:
     """Download artifact to dest. Returns True when dest is usable, False otherwise."""
     assert_downloading_allowed()
 
-    if _cache_hit(dest):
-        logger.info("USING CACHED ARTIFACT: %s", dest)
-        return True
+    with _download_lock(dest):
+        if _artifact_file_valid(dest, logical_key):
+            logger.info("USING CACHED ARTIFACT: %s", dest)
+            return True
 
-    safe_mkdir(dest.parent)
-    part_path = Path(f"{dest}.part").resolve()
-    assert_no_repo_write(str(part_path))
+        safe_mkdir(dest.parent)
+        part_path = Path(f"{dest}.part").resolve()
+        assert_no_repo_write(str(part_path))
 
-    logger.info("Artifact download URL: %s", url)
-    logger.info("Artifact destination: %s", dest)
+        logger.info("Artifact download URL: %s", url)
+        logger.info("Artifact destination: %s", dest)
 
-    attempts = len(_RETRY_BACKOFF_SECONDS) + 1
-    for attempt in range(attempts):
-        if attempt > 0:
-            backoff = _RETRY_BACKOFF_SECONDS[attempt - 1]
-            logger.warning(
-                "Retrying artifact download in %ss (attempt %d/%d): %s",
-                backoff,
-                attempt + 1,
-                attempts,
-                url,
-            )
-            time.sleep(backoff)
+        attempts = len(_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            if _artifact_file_valid(dest, logical_key):
+                _remove_part_file(part_path)
+                return True
 
-        try:
-            response = requests.get(url, timeout=300, stream=True)
-        except requests.exceptions.RequestException as exc:
-            logger.warning("Artifact download request failed: %s (%s)", url, exc)
-            if attempt + 1 >= attempts:
-                return _use_stale_or_fail(dest)
-            continue
+            if attempt > 0:
+                backoff = _RETRY_BACKOFF_SECONDS[attempt - 1]
+                logger.warning(
+                    "Retrying artifact download in %ss (attempt %d/%d): %s",
+                    backoff,
+                    attempt + 1,
+                    attempts,
+                    url,
+                )
+                time.sleep(backoff)
 
-        if response.status_code == 404:
-            logger.warning("Artifact missing on remote, skipping download: %s", url)
+            _remove_part_file(part_path)
+
+            try:
+                response = requests.get(url, timeout=300, stream=True)
+            except requests.exceptions.RequestException as exc:
+                logger.warning("Artifact download request failed: %s (%s)", url, exc)
+                if attempt + 1 >= attempts:
+                    return _use_stale_or_fail(dest, logical_key)
+                continue
+
+            if response.status_code == 404:
+                logger.warning("Artifact missing on remote, skipping download: %s", url)
+                response.close()
+                return _use_stale_or_fail(dest, logical_key)
+
+            if response.status_code in _RETRYABLE_STATUS_CODES:
+                logger.warning(
+                    "Retryable HTTP %s for artifact download: %s",
+                    response.status_code,
+                    url,
+                )
+                response.close()
+                if attempt + 1 >= attempts:
+                    return _use_stale_or_fail(dest, logical_key)
+                continue
+
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                logger.warning("Artifact download HTTP error: %s (%s)", url, exc)
+                response.close()
+                if attempt + 1 >= attempts:
+                    return _use_stale_or_fail(dest, logical_key)
+                continue
+
+            if not _write_response_to_part(response, part_path):
+                response.close()
+                _remove_part_file(part_path)
+                if attempt + 1 >= attempts:
+                    return _use_stale_or_fail(dest, logical_key)
+                continue
+
             response.close()
-            return _use_stale_or_fail(dest)
+            if not _finalize_part_download(part_path, dest, logical_key):
+                if attempt + 1 >= attempts:
+                    return _use_stale_or_fail(dest, logical_key)
+                continue
 
-        if response.status_code in _RETRYABLE_STATUS_CODES:
-            logger.warning(
-                "Retryable HTTP %s for artifact download: %s",
-                response.status_code,
-                url,
-            )
-            response.close()
-            if attempt + 1 >= attempts:
-                return _use_stale_or_fail(dest)
-            continue
+            logger.info("DOWNLOAD COMPLETED: %s (%d bytes)", dest, os.path.getsize(dest))
+            return True
 
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            logger.warning("Artifact download HTTP error: %s (%s)", url, exc)
-            response.close()
-            if attempt + 1 >= attempts:
-                return _use_stale_or_fail(dest)
-            continue
-
-        if not _write_response_to_part(response, part_path):
-            response.close()
-            if part_path.exists():
-                try:
-                    part_path.unlink()
-                except OSError:
-                    pass
-            if attempt + 1 >= attempts:
-                return _use_stale_or_fail(dest)
-            continue
-
-        response.close()
-        try:
-            assert_no_repo_write(str(dest))
-            os.replace(part_path, dest)
-        except OSError as exc:
-            logger.error("Failed to finalize artifact download %s: %s", dest, exc)
-            if part_path.exists():
-                try:
-                    part_path.unlink()
-                except OSError:
-                    pass
-            if attempt + 1 >= attempts:
-                return _use_stale_or_fail(dest)
-            continue
-
-        logger.info("DOWNLOAD COMPLETED: %s (%d bytes)", dest, os.path.getsize(dest))
-        return True
-
-    return _use_stale_or_fail(dest)
+        return _use_stale_or_fail(dest, logical_key)
 
 
 def _ensure_artifact(
@@ -277,8 +350,11 @@ def _ensure_artifact(
     repo_path = (_repo_root() / logical).resolve()
     if _artifact_file_valid(repo_path, logical_key):
         logger.info("Using existing repo artifact (read-only): %s", repo_path)
-        status["cached"].append(logical)
-        return repo_path
+        if _materialize_to_cache(repo_path, cache_path, logical_key):
+            status["cached"].append(logical)
+            return cache_path
+        status["failed"].append(logical)
+        return None
 
     remote_name = _ARTIFACT_REMOTE_NAMES.get(logical_key)
     if remote_name is None:
@@ -292,22 +368,16 @@ def _ensure_artifact(
             "ARTIFACT_BASE_URL not set; cannot download %s. Checking local cache only.",
             logical_key,
         )
-        if _use_stale_or_fail(cache_path):
+        if _use_stale_or_fail(cache_path, logical_key):
             status["cached"].append(logical)
             return cache_path
         status["missing"].append(logical)
         return None
 
     url = f"{base_url}/{remote_name}"
-    if _download_if_missing(url, cache_path):
-        if _artifact_file_valid(cache_path, logical_key):
-            status["cached"].append(logical)
-            return cache_path
-        if _cache_hit(cache_path):
-            status["cached"].append(logical)
-            return cache_path
-
-    if _cache_hit(cache_path):
+    if _download_if_missing(url, cache_path, logical_key) and _artifact_file_valid(
+        cache_path, logical_key
+    ):
         status["cached"].append(logical)
         return cache_path
 
@@ -319,18 +389,32 @@ def _empty_status() -> BootstrapStatus:
     return {"success": False, "missing": [], "failed": [], "cached": []}
 
 
+def _logical_paths_for_cache(paths: list[str]) -> list[tuple[str, str]]:
+    """Pair logical artifact keys with on-disk cache paths."""
+    return list(zip(_CACHE_LOGICAL_PATHS, paths, strict=True))
+
+
 def _finalize_status(status: BootstrapStatus, paths: list[str]) -> BootstrapStatus:
-    present = {logical for logical, path in zip(_ARTIFACT_LOGICAL_PATHS, paths, strict=True) if _cache_hit(Path(path))}
-    status["missing"] = [logical for logical in _ARTIFACT_LOGICAL_PATHS if logical not in present]
+    present = {
+        logical
+        for logical, path in _logical_paths_for_cache(paths)
+        if _artifact_file_valid(Path(path), logical)
+    }
+    status["missing"] = [logical for logical in _CACHE_LOGICAL_PATHS if logical not in present]
     status["success"] = not status["missing"] and not status["failed"]
     return status
 
 
 def bootstrap_artifacts(cache_dir: str | None = None) -> BootstrapStatus:
-    """Download deployment artifacts at process start. Never raises on remote failure."""
+    """Download deployment artifacts at process start.
+
+    Raises ``RuntimeError`` when any required artifact cannot be materialized.
+    """
     global _bootstrap_complete, _last_bootstrap_status, _preloaded_artifacts
 
     if _bootstrap_complete and _last_bootstrap_status is not None:
+        if not _last_bootstrap_status["success"]:
+            require_bootstrap_success()
         return _last_bootstrap_status
 
     if _streamlit_runtime:
@@ -345,7 +429,7 @@ def bootstrap_artifacts(cache_dir: str | None = None) -> BootstrapStatus:
     status: BootstrapStatus = _empty_status()
 
     with _downloading_phase():
-        for logical in _ARTIFACT_LOGICAL_PATHS:
+        for logical in _CACHE_LOGICAL_PATHS:
             try:
                 _ensure_artifact(resolved_cache_dir, logical, status)
             except Exception as exc:
@@ -361,7 +445,11 @@ def bootstrap_artifacts(cache_dir: str | None = None) -> BootstrapStatus:
     except RuntimeError as exc:
         logger.warning("Repo write verification warning during bootstrap: %s", exc)
 
-    all_present = all(_cache_hit(Path(path)) for path in paths)
+    all_present = all(
+        _artifact_file_valid(Path(path), logical)
+        for logical, path in _logical_paths_for_cache(paths)
+    )
+    _preloaded_artifacts = None
     if all_present:
         try:
             from src.infrastructure.storage.artifact_loader import ArtifactLoader
@@ -374,37 +462,37 @@ def bootstrap_artifacts(cache_dir: str | None = None) -> BootstrapStatus:
         except Exception as exc:
             logger.error("Failed to preload artifacts into memory: %s", exc)
             status["success"] = False
-    else:
-        logger.warning(
-            "Skipping artifact preload; partial data mode (%d/%d files present).",
-            sum(1 for path in paths if _cache_hit(Path(path))),
-            len(paths),
-        )
-        status["success"] = False
+            _preloaded_artifacts = None
 
     if status["failed"]:
-        logger.warning("Artifact bootstrap failures: %s", status["failed"])
+        logger.error("Artifact bootstrap failures: %s", status["failed"])
     if status["missing"]:
-        logger.warning("Artifact bootstrap missing: %s", status["missing"])
+        logger.error("Artifact bootstrap missing: %s", status["missing"])
 
     _bootstrap_complete = True
     _last_bootstrap_status = status
 
     if status["success"]:
         message = "ARTIFACT PHASE COMPLETE (ALL FILES LOCAL)"
-    else:
-        message = "ARTIFACT PHASE COMPLETE (PARTIAL - degraded mode)"
-    logger.info(message)
-    print(message, flush=True)
+        logger.info(message)
+        print(message, flush=True)
+        return status
 
-    return status
+    message = "ARTIFACT PHASE FAILED"
+    logger.error(message)
+    print(message, flush=True)
+    raise RuntimeError(
+        "Artifact bootstrap failed; required artifacts are unavailable. "
+        f"missing={status['missing']}, failed={status['failed']}"
+    )
 
 
 def get_preloaded_artifacts() -> "LoadedArtifacts":
     """Return artifacts loaded during bootstrap (read-only after bootstrap)."""
+    require_bootstrap_success()
     if _preloaded_artifacts is None:
         raise RuntimeError(
-            "bootstrap_artifacts() must complete before pipeline build; "
+            "bootstrap_artifacts() must complete successfully before pipeline build; "
             "call it at process start before importing Streamlit."
         )
     return _preloaded_artifacts

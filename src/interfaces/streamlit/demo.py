@@ -25,7 +25,11 @@ HF_HOME = os.environ.get("HF_HOME", "/tmp/hf_cache")
 from src.bootstrap.bootstrap_artifacts import bootstrap_artifacts, is_bootstrap_complete, mark_streamlit_runtime
 
 if not is_bootstrap_complete():
-    bootstrap_artifacts(CACHE_DIR)
+    try:
+        bootstrap_artifacts(CACHE_DIR)
+    except RuntimeError as exc:
+        print(f"ARTIFACT BOOTSTRAP FAILED: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 try:
     import streamlit as st

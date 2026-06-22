@@ -100,6 +100,9 @@ def build_pipeline(
     artifacts: LoadedArtifacts,
 ) -> RAGPipeline:
     """Build the retrieval stack from preloaded in-memory artifacts (pure: no IO)."""
+    from src.bootstrap.bootstrap_artifacts import require_bootstrap_success
+
+    require_bootstrap_success()
     with pure_build_guard():
         app_config = AppConfig.default()
         embedding_service = LazySentenceTransformerEmbeddingService(
