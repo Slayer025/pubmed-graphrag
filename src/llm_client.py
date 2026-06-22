@@ -40,6 +40,10 @@ __all__ = [
     "OllamaClient",
     "create_llm_client",
     "create_llm_client_with_mode",
+    "get_openai_package_version",
+    "is_openai_package_installed",
+    "log_llm_startup_diagnostics",
+    "log_openai_package_version",
     "resolve_effective_llm_mode",
 ]
 
@@ -50,6 +54,8 @@ class LLMClientResult:
 
     client: LLMClient
     mode: str
+    selected_mode: str
+    fallback_reason: str | None = None
 
 
 _MOCK_STOPWORDS = frozenset(
@@ -89,7 +95,6 @@ _CHUNK_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
-_MOCK_MODE_LABEL = "MODE: RETRIEVAL-ONLY (NO LLM REASONING)"
 _MOCK_TOP_K_CHUNKS = 3
 _MOCK_MIN_TOP_CHUNK_SCORE = 0.55
 _INSUFFICIENT_EVIDENCE = "Insufficient evidence in retrieved context."
@@ -183,8 +188,18 @@ def _select_top_chunks(chunks: list[tuple[str, float, str]]) -> list[tuple[str, 
     return sorted(chunks, key=lambda item: (-item[1], item[0]))[:_MOCK_TOP_K_CHUNKS]
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _format_mock_answer(bullets: list[str], source_ids: list[str]) -> str:
+    answer_lines = "\n".join(f"* {bullet}" for bullet in bullets)
+    source_lines = "\n".join(f"* {chunk_id}" for chunk_id in source_ids)
+    return f"Answer:\n\n{answer_lines}\n\nSources:\n\n{source_lines}"
+
+
 def _insufficient_evidence_answer() -> str:
-    return f"{_MOCK_MODE_LABEL}\n\nAnswer:\n- {_INSUFFICIENT_EVIDENCE}\n\nSources:"
+    return _format_mock_answer([_INSUFFICIENT_EVIDENCE], [])
 
 
 def _build_extractive_answer(question: str, chunks: list[tuple[str, float, str]]) -> str:
@@ -200,15 +215,24 @@ def _build_extractive_answer(question: str, chunks: list[tuple[str, float, str]]
         sentence = _best_sentence_for_chunk(text, question, question_words)
         if sentence is None:
             continue
-        bullets.append(f"{sentence} ({chunk_id})")
+        bullets.append(sentence)
         source_ids.append(chunk_id)
 
-    if not bullets:
+    deduped_bullets: list[str] = []
+    deduped_sources: list[str] = []
+    seen: set[str] = set()
+    for bullet, chunk_id in zip(bullets, source_ids, strict=True):
+        key = _normalize_text(bullet).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_bullets.append(_normalize_text(bullet))
+        deduped_sources.append(chunk_id)
+
+    if not deduped_bullets:
         return _insufficient_evidence_answer()
 
-    answer_lines = "\n".join(f"- {bullet}" for bullet in bullets)
-    source_lines = "\n".join(f"- {chunk_id}" for chunk_id in source_ids)
-    return f"{_MOCK_MODE_LABEL}\n\nAnswer:\n{answer_lines}\n\nSources:\n{source_lines}"
+    return _format_mock_answer(deduped_bullets, deduped_sources)
 
 
 class MockLLMClient:
@@ -350,22 +374,65 @@ def _resolve_openai_api_key(api_key: str | None = None) -> str | None:
     return resolved or None
 
 
+def is_openai_package_installed() -> bool:
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def get_openai_package_version() -> str | None:
+    try:
+        import openai
+    except ImportError:
+        return None
+    return getattr(openai, "__version__", None)
+
+
+def log_openai_package_version() -> None:
+    if is_openai_package_installed():
+        logger.info("OpenAI package version: %s", get_openai_package_version())
+    else:
+        logger.info("OpenAI package not installed")
+
+
+def log_llm_startup_diagnostics(selected_mode: str, effective_mode: str) -> None:
+    """Emit startup diagnostics for LLM configuration."""
+    logger.info("OPENAI_API_KEY present: %s", bool(_resolve_openai_api_key()))
+    logger.info("OpenAI package installed: %s", is_openai_package_installed())
+    log_openai_package_version()
+    logger.info("Selected mode: %s", selected_mode)
+    logger.info("Effective mode: %s", effective_mode)
+
+
+def _normalize_selected_mode(client_type: str) -> str:
+    normalized = client_type.lower().strip()
+    if normalized in {LLM_MODE_MOCK, LLM_MODE_OPENAI, LLM_MODE_OLLAMA}:
+        return normalized
+    return LLM_MODE_MOCK
+
+
+def _mock_fallback(
+    selected_mode: str,
+    reason: str,
+) -> LLMClientResult:
+    logger.warning("%s Falling back to mock mode.", reason)
+    return LLMClientResult(
+        client=MockLLMClient(),
+        mode=LLM_MODE_MOCK,
+        selected_mode=selected_mode,
+        fallback_reason=reason,
+    )
+
+
 def resolve_effective_llm_mode(
     client_type: str,
     *,
     api_key: str | None = None,
 ) -> str:
-    """Return the explicit runtime LLM mode for a requested client type."""
-    normalized = client_type.lower().strip()
-    if normalized == "openai":
-        if not _resolve_openai_api_key(api_key):
-            return LLM_MODE_DISABLED_OPENAI_MISSING_KEY
-        return LLM_MODE_OPENAI
-    if normalized == "ollama":
-        return LLM_MODE_OLLAMA
-    if normalized == "mock":
-        return LLM_MODE_MOCK
-    return LLM_MODE_MOCK
+    """Return the effective runtime LLM mode for a requested client type."""
+    return create_llm_client_with_mode(client_type, api_key=api_key).mode
 
 
 def create_llm_client_with_mode(
@@ -376,40 +443,54 @@ def create_llm_client_with_mode(
     base_url: str | None = None,
     ollama_url: str | None = None,
 ) -> LLMClientResult:
-    """Factory returning both client and explicit ``effective_llm_mode``."""
-    normalized = client_type.lower().strip()
-    mode = resolve_effective_llm_mode(normalized, api_key=api_key)
-    logger.info("LLM MODE: %s", mode)
+    """Factory returning both client and explicit effective runtime mode."""
+    selected_mode = _normalize_selected_mode(client_type)
 
-    if mode == LLM_MODE_DISABLED_OPENAI_MISSING_KEY:
-        logger.warning(
-            "OpenAI selected but API key missing in Streamlit secrets. "
-            "Running with mock client (mode=disabled_openai_missing_key)."
-        )
-        return LLMClientResult(client=MockLLMClient(), mode=mode)
+    if selected_mode == LLM_MODE_OPENAI:
+        if not _resolve_openai_api_key(api_key):
+            reason = "OPENAI_API_KEY is not set."
+            result = _mock_fallback(selected_mode, reason)
+            logger.info("Effective mode: %s", result.mode)
+            return result
+        if not is_openai_package_installed():
+            reason = "OpenAI package is not installed."
+            result = _mock_fallback(selected_mode, reason)
+            logger.info("Effective mode: %s", result.mode)
+            return result
 
     try:
-        if mode == LLM_MODE_OPENAI:
+        if selected_mode == LLM_MODE_OPENAI:
             resolved_key = _resolve_openai_api_key(api_key)
             assert resolved_key is not None
-            return LLMClientResult(
-                client=OpenAIClient(api_key=resolved_key, model=model, base_url=base_url),
+            client = OpenAIClient(api_key=resolved_key, model=model, base_url=base_url)
+            result = LLMClientResult(
+                client=client,
                 mode=LLM_MODE_OPENAI,
+                selected_mode=selected_mode,
             )
-        if mode == LLM_MODE_OLLAMA:
-            return LLMClientResult(
+            logger.info("Effective mode: %s", result.mode)
+            return result
+        if selected_mode == LLM_MODE_OLLAMA:
+            result = LLMClientResult(
                 client=OllamaClient(url=ollama_url, model=model),
                 mode=LLM_MODE_OLLAMA,
+                selected_mode=selected_mode,
             )
-        return LLMClientResult(client=MockLLMClient(), mode=LLM_MODE_MOCK)
-    except Exception as exc:
-        logger.warning(
-            "Failed to create LLM client %r (%s), falling back to mock",
-            normalized,
-            exc,
+            logger.info("Effective mode: %s", result.mode)
+            return result
+        result = LLMClientResult(
+            client=MockLLMClient(),
+            mode=LLM_MODE_MOCK,
+            selected_mode=selected_mode,
         )
-        logger.info("LLM MODE: %s", LLM_MODE_MOCK)
-        return LLMClientResult(client=MockLLMClient(), mode=LLM_MODE_MOCK)
+        logger.info("Effective mode: %s", result.mode)
+        return result
+    except Exception as exc:
+        reason = f"OpenAI initialization failed: {exc}"
+        logger.exception(reason)
+        result = _mock_fallback(selected_mode, reason)
+        logger.info("Effective mode: %s", result.mode)
+        return result
 
 
 def create_llm_client(

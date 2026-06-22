@@ -53,9 +53,10 @@ from src.domain.entities.retrieval_result import RetrievalResult
 from src.domain.value_objects.query import Query
 from src.graph_reranker import GraphReranker
 from src.llm_client import (
-    LLM_MODE_DISABLED_OPENAI_MISSING_KEY,
+    LLM_MODE_MOCK,
+    LLM_MODE_OPENAI,
     create_llm_client_with_mode,
-    resolve_effective_llm_mode,
+    log_llm_startup_diagnostics,
 )
 from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
@@ -224,6 +225,48 @@ def _openai_api_key_available() -> bool:
     return bool((os.environ.get("OPENAI_API_KEY") or "").strip())
 
 
+def _active_llm_mode(selection: Any) -> str:
+    """Return the effective LLM mode from an instantiated client selection."""
+    return selection.mode
+
+
+def _render_llm_mode_sidebar() -> tuple[str, Any]:
+    """Render LLM controls and return selected type plus instantiated client."""
+    llm_options = ["mock"]
+    if _openai_api_key_available():
+        llm_options.append("openai")
+    if os.environ.get("OLLAMA_URL"):
+        llm_options.append("ollama")
+
+    if "llm_client_select" not in st.session_state:
+        st.session_state.llm_client_select = "mock"
+    if st.session_state.llm_client_select == "openai" and not _openai_api_key_available():
+        st.session_state.llm_client_select = "mock"
+    if st.session_state.llm_client_select not in llm_options:
+        st.session_state.llm_client_select = "mock"
+
+    llm_client_type = st.selectbox(
+        "LLM client",
+        options=llm_options,
+        index=llm_options.index(st.session_state.llm_client_select),
+        help="Select the LLM used for generation. OpenAI appears only when OPENAI_API_KEY is set.",
+        key="llm_client_select",
+    )
+    llm_selection = create_llm_client_with_mode(llm_client_type)
+    effective_llm_mode = _active_llm_mode(llm_selection)
+    st.caption(f"Active LLM mode: `{effective_llm_mode}`")
+    if not _openai_api_key_available():
+        st.caption("Add `OPENAI_API_KEY` in Streamlit secrets to enable OpenAI.")
+    if (
+        llm_client_type == LLM_MODE_OPENAI
+        and effective_llm_mode == LLM_MODE_MOCK
+        and llm_selection.fallback_reason
+    ):
+        st.warning("OpenAI initialization failed. Running in mock mode.")
+        logger.warning("OpenAI fallback reason: %s", llm_selection.fallback_reason)
+    return llm_client_type, llm_selection
+
+
 def _render_graph_evidence(graph_repository: Any, results: list[RetrievalResult]) -> None:
     st.subheader("Graph evidence")
     if not results:
@@ -255,34 +298,18 @@ def main() -> int:
         "PubMed abstracts using graph-enhanced retrieval."
     )
 
+    if "llm_startup_logged" not in st.session_state:
+        st.session_state.llm_startup_logged = False
+
     with st.sidebar:
         st.header("Model")
-
-        llm_options = ["mock"]
-        if _openai_api_key_available():
-            llm_options.append("openai")
-        if os.environ.get("OLLAMA_URL"):
-            llm_options.append("ollama")
-
-        if "llm_client_select" not in st.session_state:
-            st.session_state.llm_client_select = "mock"
-        if st.session_state.llm_client_select == "openai" and not _openai_api_key_available():
-            st.session_state.llm_client_select = "mock"
-        if st.session_state.llm_client_select not in llm_options:
-            st.session_state.llm_client_select = "mock"
-
-        llm_client_type = st.selectbox(
-            "LLM client",
-            options=llm_options,
-            index=llm_options.index(st.session_state.llm_client_select),
-            help="Select the LLM used for generation. OpenAI appears only when OPENAI_API_KEY is set.",
-            key="llm_client_select",
-        )
-        effective_llm_mode = resolve_effective_llm_mode(llm_client_type)
-        logger.info("LLM MODE: %s", effective_llm_mode)
-        st.caption(f"Active LLM mode: `{effective_llm_mode}`")
-        if not _openai_api_key_available():
-            st.caption("Add `OPENAI_API_KEY` in Streamlit secrets to enable OpenAI.")
+        llm_client_type, llm_selection = _render_llm_mode_sidebar()
+        if not st.session_state.llm_startup_logged:
+            log_llm_startup_diagnostics(
+                llm_selection.selected_mode,
+                llm_selection.mode,
+            )
+            st.session_state.llm_startup_logged = True
 
         st.header("Retrieval")
         top_k = st.slider("top_k", 1, 50, 10)
@@ -310,12 +337,6 @@ def main() -> int:
         "alpha": alpha,
         "max_results": max_results,
     }
-
-    if effective_llm_mode == LLM_MODE_DISABLED_OPENAI_MISSING_KEY:
-        st.warning(
-            "OpenAI key missing. Running in MOCK mode. "
-            "Add OPENAI_API_KEY in Streamlit secrets to enable real answers."
-        )
 
     try:
         pipeline = get_pipeline(HF_HOME)
@@ -367,8 +388,11 @@ def main() -> int:
 
         if answer_clicked:
             with st.spinner("Generating answer..."):
-                llm_selection = create_llm_client_with_mode(llm_client_type)
-                logger.info("LLM MODE: %s", llm_selection.mode)
+                logger.info(
+                    "Selected mode: %s | Effective mode: %s",
+                    llm_selection.selected_mode,
+                    llm_selection.mode,
+                )
                 answer = GenerateAnswerUseCase(llm=llm_selection.client).execute(
                     Query(query),
                     results,
