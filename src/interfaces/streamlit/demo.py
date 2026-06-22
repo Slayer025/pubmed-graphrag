@@ -216,6 +216,17 @@ def _render_result_card(rank: int, result: RetrievalResult) -> None:
         st.markdown(f"> {result.text}")
 
 
+def _openai_api_key_available() -> bool:
+    return bool((os.environ.get("OPENAI_API_KEY") or "").strip())
+
+
+def _resolve_llm_client_type(selected_type: str) -> str:
+    """Use mock when OpenAI is selected but credentials are missing."""
+    if selected_type == "openai" and not _openai_api_key_available():
+        return "mock"
+    return selected_type
+
+
 def _render_graph_evidence(graph_repository: Any, results: list[RetrievalResult]) -> None:
     st.subheader("Graph evidence")
     if not results:
@@ -254,12 +265,28 @@ def main() -> int:
         if os.environ.get("OLLAMA_URL"):
             llm_options.append("ollama")
 
+        if "llm_client_select" not in st.session_state:
+            st.session_state.llm_client_select = "mock"
+        if st.session_state.llm_client_select == "openai" and not _openai_api_key_available():
+            st.session_state.llm_client_select = "mock"
+        if st.session_state.llm_client_select not in llm_options:
+            st.session_state.llm_client_select = "mock"
+
         llm_client_type = st.selectbox(
             "LLM client",
             options=llm_options,
-            index=0,
+            index=llm_options.index(st.session_state.llm_client_select),
             help="Select the LLM used for generation. Ollama only appears if OLLAMA_URL is set.",
+            key="llm_client_select",
         )
+        if llm_client_type == "openai" and not _openai_api_key_available():
+            st.warning(
+                "OpenAI selected but API key missing in Streamlit secrets. Using mock client."
+            )
+            if st.session_state.llm_client_select != "mock":
+                st.session_state.llm_client_select = "mock"
+                st.rerun()
+        effective_llm_client_type = _resolve_llm_client_type(llm_client_type)
 
         st.header("Retrieval")
         top_k = st.slider("top_k", 1, 50, 10)
@@ -315,7 +342,7 @@ def main() -> int:
                 graph_repository,
                 query,
                 search_config,
-                llm_client_type=llm_client_type,
+                llm_client_type=effective_llm_client_type,
                 use_reranker=use_reranker,
                 reranker_beta=reranker_beta,
                 use_decomposer=use_decomposer,
@@ -338,7 +365,7 @@ def main() -> int:
 
         if answer_clicked:
             with st.spinner("Generating answer..."):
-                llm = create_llm_client(llm_client_type)
+                llm = create_llm_client(effective_llm_client_type)
                 answer = GenerateAnswerUseCase(llm=llm).execute(Query(query), results)
             st.subheader("Answer")
             st.markdown(answer)

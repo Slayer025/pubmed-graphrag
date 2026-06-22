@@ -148,6 +148,11 @@ class OllamaClient:
         return content.strip()
 
 
+def _resolve_openai_api_key(api_key: str | None = None) -> str | None:
+    resolved = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
+    return resolved or None
+
+
 def create_llm_client(
     client_type: str = "mock",
     *,
@@ -166,16 +171,32 @@ def create_llm_client(
         ollama_url: Optional Ollama base URL.
 
     Returns:
-        An ``LLMClient``-compatible instance.
+        An ``LLMClient``-compatible instance. Never raises; falls back to mock.
     """
     client_type = client_type.lower().strip()
-    if client_type == "openai":
-        return OpenAIClient(api_key=api_key, model=model, base_url=base_url)
-    if client_type == "ollama":
-        return OllamaClient(url=ollama_url, model=model)
-    if client_type == "mock":
+    try:
+        if client_type == "openai":
+            resolved_key = _resolve_openai_api_key(api_key)
+            if not resolved_key:
+                logger.warning(
+                    "OpenAI selected but API key missing in Streamlit secrets. "
+                    "OPENAI_API_KEY missing, falling back to mock"
+                )
+                return MockLLMClient()
+            return OpenAIClient(api_key=resolved_key, model=model, base_url=base_url)
+        if client_type == "ollama":
+            return OllamaClient(url=ollama_url, model=model)
+        if client_type == "mock":
+            return MockLLMClient()
+        logger.warning("Unknown LLM client type %r, falling back to mock", client_type)
         return MockLLMClient()
-    raise ValueError(f"Unknown LLM client type: {client_type}")
+    except Exception as exc:
+        logger.warning(
+            "Failed to create LLM client %r (%s), falling back to mock",
+            client_type,
+            exc,
+        )
+        return MockLLMClient()
 
 
 def main() -> int:
