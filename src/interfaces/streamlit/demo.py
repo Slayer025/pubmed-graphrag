@@ -55,8 +55,10 @@ from src.graph_reranker import GraphReranker
 from src.llm_client import (
     LLM_MODE_MOCK,
     LLM_MODE_OPENAI,
+    UNABLE_TO_GENERATE_ANSWER,
     create_llm_client_with_mode,
     log_llm_startup_diagnostics,
+    safe_llm_complete,
 )
 from src.query_decomposer import DecomposerConfig, QueryDecomposer
 from src.rag_pipeline import RAGPipeline
@@ -267,6 +269,16 @@ def _render_llm_mode_sidebar() -> tuple[str, Any]:
     return llm_client_type, llm_selection
 
 
+def _generate_answer_safe(
+    query: str,
+    results: list[RetrievalResult],
+    llm: Any,
+) -> str:
+    """Generate an answer without propagating LLM exceptions to the UI."""
+    prompt = GenerateAnswerUseCase._build_prompt(query, results)
+    return safe_llm_complete(llm, prompt)
+
+
 def _render_graph_evidence(graph_repository: Any, results: list[RetrievalResult]) -> None:
     st.subheader("Graph evidence")
     if not results:
@@ -393,10 +405,9 @@ def main() -> int:
                     llm_selection.selected_mode,
                     llm_selection.mode,
                 )
-                answer = GenerateAnswerUseCase(llm=llm_selection.client).execute(
-                    Query(query),
-                    results,
-                )
+                answer = _generate_answer_safe(query, results, llm_selection.client)
+                if answer == UNABLE_TO_GENERATE_ANSWER:
+                    st.warning("Answer generation fell back to a safe default.")
             st.subheader("Answer")
             st.markdown(answer)
 

@@ -38,6 +38,9 @@ __all__ = [
     "MockLLMClient",
     "OpenAIClient",
     "OllamaClient",
+    "ANSWER_EVIDENCE_SUBTITLE",
+    "UNABLE_TO_GENERATE_ANSWER",
+    "safe_llm_complete",
     "create_llm_client",
     "create_llm_client_with_mode",
     "get_openai_package_version",
@@ -97,7 +100,30 @@ _CHUNK_HEADER_RE = re.compile(
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _MOCK_TOP_K_CHUNKS = 3
 _MOCK_MIN_TOP_CHUNK_SCORE = 0.55
+_MOCK_BULLET_LABELS = ("Risk factor", "Association", "Evidence")
+ANSWER_EVIDENCE_SUBTITLE = "Answer generated from retrieved PubMed evidence."
+UNABLE_TO_GENERATE_ANSWER = "Unable to generate answer from retrieved context."
 _INSUFFICIENT_EVIDENCE = "Insufficient evidence in retrieved context."
+_LEGACY_MODE_LABEL = "MODE: RETRIEVAL-ONLY (NO LLM REASONING)"
+_NOISE_SECTION_WORDS = frozenset(
+    {
+        "abstract",
+        "aim",
+        "background",
+        "conclusion",
+        "design",
+        "introduction",
+        "methods",
+        "objective",
+        "purpose",
+        "results",
+        "setting",
+    }
+)
+_SECTION_PREFIX_RE = re.compile(
+    r"^(background|objective|methods|results|conclusion|introduction|abstract|purpose|aim|design|setting)\s*[:.\-]\s*",
+    re.IGNORECASE,
+)
 
 
 def _question_terms(question: str) -> set[str]:
@@ -173,6 +199,8 @@ def _best_sentence_for_chunk(
     best_score = 0
     best_index = 0
     for index, sentence in enumerate(sentences):
+        if _is_noisy_sentence(sentence):
+            continue
         score = _sentence_score(sentence, question, question_words)
         if score == 0:
             continue
@@ -180,7 +208,9 @@ def _best_sentence_for_chunk(
             best_score = score
             best_index = index
             best_sentence = sentence
-    return best_sentence
+    if best_sentence is not None:
+        return _clean_extracted_sentence(best_sentence)
+    return None
 
 
 def _select_top_chunks(chunks: list[tuple[str, float, str]]) -> list[tuple[str, float, str]]:
@@ -192,14 +222,40 @@ def _normalize_text(text: str) -> str:
     return " ".join(text.split())
 
 
-def _format_mock_answer(bullets: list[str], source_ids: list[str]) -> str:
-    answer_lines = "\n".join(f"* {bullet}" for bullet in bullets)
-    source_lines = "\n".join(f"* {chunk_id}" for chunk_id in source_ids)
-    return f"Answer:\n\n{answer_lines}\n\nSources:\n\n{source_lines}"
+def _clean_extracted_sentence(sentence: str) -> str:
+    cleaned = _normalize_text(sentence)
+    cleaned = _SECTION_PREFIX_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _is_noisy_sentence(sentence: str) -> bool:
+    cleaned = _clean_extracted_sentence(sentence)
+    if not cleaned:
+        return True
+    first_token = cleaned.lower().split(None, 1)[0].rstrip(":")
+    return first_token in _NOISE_SECTION_WORDS
+
+
+def _sanitize_answer_text(answer: str) -> str:
+    """Remove legacy debug labels from user-visible answer text."""
+    if _LEGACY_MODE_LABEL in answer:
+        answer = answer.replace(_LEGACY_MODE_LABEL, ANSWER_EVIDENCE_SUBTITLE)
+    return answer.strip()
+
+
+def _format_mock_answer(labeled_bullets: list[tuple[str, str]], source_ids: list[str]) -> str:
+    lines = [ANSWER_EVIDENCE_SUBTITLE, "", "Answer:"]
+    for label, text in labeled_bullets:
+        lines.append(f"- {label}: {text}")
+    lines.append("")
+    lines.append("Sources:")
+    for chunk_id in source_ids:
+        lines.append(f"- {chunk_id}")
+    return "\n".join(lines)
 
 
 def _insufficient_evidence_answer() -> str:
-    return _format_mock_answer([_INSUFFICIENT_EVIDENCE], [])
+    return f"{ANSWER_EVIDENCE_SUBTITLE}\n\nAnswer:\n- {_INSUFFICIENT_EVIDENCE}\n\nSources:"
 
 
 def _build_extractive_answer(question: str, chunks: list[tuple[str, float, str]]) -> str:
@@ -209,24 +265,27 @@ def _build_extractive_answer(question: str, chunks: list[tuple[str, float, str]]
         return _insufficient_evidence_answer()
 
     question_words = _question_terms(question)
-    bullets: list[str] = []
+    labeled_bullets: list[tuple[str, str]] = []
     source_ids: list[str] = []
     for chunk_id, _, text in ranked_chunks:
         sentence = _best_sentence_for_chunk(text, question, question_words)
         if sentence is None:
             continue
-        bullets.append(sentence)
+        label = _MOCK_BULLET_LABELS[len(labeled_bullets)]
+        labeled_bullets.append((label, sentence))
         source_ids.append(chunk_id)
+        if len(labeled_bullets) >= len(_MOCK_BULLET_LABELS):
+            break
 
-    deduped_bullets: list[str] = []
+    deduped_bullets: list[tuple[str, str]] = []
     deduped_sources: list[str] = []
     seen: set[str] = set()
-    for bullet, chunk_id in zip(bullets, source_ids, strict=True):
+    for (label, bullet), chunk_id in zip(labeled_bullets, source_ids, strict=True):
         key = _normalize_text(bullet).lower()
         if key in seen:
             continue
         seen.add(key)
-        deduped_bullets.append(_normalize_text(bullet))
+        deduped_bullets.append((label, bullet))
         deduped_sources.append(chunk_id)
 
     if not deduped_bullets:
@@ -246,14 +305,14 @@ class MockLLMClient:
         parsed = _parse_answer_prompt(prompt)
         if parsed is not None:
             question, chunks = parsed
-            return _build_extractive_answer(question, chunks)
+            return _sanitize_answer_text(_build_extractive_answer(question, chunks))
 
         if "Decompose the following question" in prompt:
             question_match = re.search(r"Question:\s*(.+?)\s*\n\nOutput:\s*$", prompt, re.DOTALL)
             if question_match is not None:
                 return f'["{question_match.group(1).strip()}"]'
 
-        return (
+        return _sanitize_answer_text(
             "[MOCK LLM] Provide retrieved context chunks to generate an extractive answer.\n\n"
             f"Prompt preview:\n{prompt[: self.max_chars]}..."
         )
@@ -302,18 +361,26 @@ class OpenAIClient:
         self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
     def complete(self, prompt: str, **kwargs: Any) -> str:
-        """Request a chat completion from the configured endpoint."""
+        """Request a chat completion; fall back to mock retrieval QA on any failure."""
         logger.info("Calling OpenAI-compatible model %s", self.model)
-        messages = [{"role": "user", "content": prompt}]
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=kwargs.get("max_tokens", self.max_tokens),
-            temperature=kwargs.get("temperature", self.temperature),
-        )
-        content = response.choices[0].message.content or ""
-        logger.info("OpenAI response received (%d chars)", len(content))
-        return content.strip()
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+                temperature=kwargs.get("temperature", self.temperature),
+            )
+            content = response.choices[0].message.content or ""
+            logger.info("OpenAI response received (%d chars)", len(content))
+            return _sanitize_answer_text(content)
+        except Exception as exc:
+            logger.warning(
+                "OpenAI API call failed (%s: %s); falling back to mock retrieval QA",
+                type(exc).__name__,
+                exc,
+            )
+            return MockLLMClient().complete(prompt, **kwargs)
 
 
 class OllamaClient:
@@ -491,6 +558,23 @@ def create_llm_client_with_mode(
         result = _mock_fallback(selected_mode, reason)
         logger.info("Effective mode: %s", result.mode)
         return result
+
+
+def safe_llm_complete(llm: LLMClient, prompt: str, **kwargs: Any) -> str:
+    """Complete a prompt without raising; always return user-visible text."""
+    try:
+        return _sanitize_answer_text(llm.complete(prompt, **kwargs))
+    except Exception as exc:
+        logger.warning(
+            "LLM complete() failed (%s: %s); attempting mock retrieval fallback",
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            return MockLLMClient().complete(prompt, **kwargs)
+        except Exception as mock_exc:
+            logger.exception("Mock retrieval fallback failed: %s", mock_exc)
+            return UNABLE_TO_GENERATE_ANSWER
 
 
 def create_llm_client(
