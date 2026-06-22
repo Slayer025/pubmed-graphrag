@@ -23,10 +23,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.bootstrap import bootstrap_pipeline
+from src.bootstrap import bootstrap_pipeline, bootstrap_retriever
 from src.config import AppConfig
 from src.domain.entities.retrieval_result import RetrievalResult
-from src.retriever import create_retriever
 
 
 def _configure_logging(level: int = logging.INFO) -> None:
@@ -134,7 +133,7 @@ def main() -> int:
     # When bypassing the LLM generation interface, build the retriever directly
     # so we can inject a pre-computed query vector.
     if args.query_chunk_id or args.query_vector_file is not None:
-        retriever = create_retriever(config)
+        retriever = bootstrap_retriever(config)
         index = retriever.index
 
         if args.query_chunk_id:

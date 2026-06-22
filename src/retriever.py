@@ -141,36 +141,14 @@ class Retriever:
         return use_case.retrieve_by_vector(query_vector, config)
 
 
+_CREATE_RETRIEVER_DEPRECATION = (
+    "create_retriever() is deprecated; use src.bootstrap.bootstrap_retriever() instead."
+)
+
+
 def create_retriever(config: AppConfig | None = None) -> Retriever:
-    """Deprecated factory: load the artifact index and build a retriever adapter."""
-    _warn_deprecation(_DEPRECATION_MESSAGE)
-    if config is None:
-        config = AppConfig.default()
-    artifacts = ArtifactLoader.load(config)
-    index = _build_index(artifacts)
-    return Retriever(index, config)
+    """Deprecated factory: delegates to ``bootstrap_retriever()``."""
+    _warn_deprecation(_CREATE_RETRIEVER_DEPRECATION)
+    from src.bootstrap import bootstrap_retriever
 
-
-def _build_index(artifacts: Any) -> Any:
-    """Build a minimal legacy index object for compatibility."""
-    graph_repository = InMemoryGraphRepository(
-        artifacts.mentions,
-        artifacts.has_chunk,
-        artifacts.chunks,
-    )
-    chunk_repository = InMemoryChunkRepository(artifacts.chunks)
-
-    class _Index:
-        def __init__(self, chunks: list[dict[str, Any]], embeddings: np.ndarray) -> None:
-            self.chunks = chunks
-            self.embeddings = embeddings
-            self.chunk_by_id = chunk_repository.get_chunks({str(c["chunk_id"]) for c in chunks})
-            self.row_by_chunk_id = {
-                str(chunk["chunk_id"]): row for row, chunk in enumerate(chunks)
-            }
-            self.article_chunks = graph_repository.article_chunks
-            self.entity_chunks = graph_repository.entity_chunks
-            self.chunk_entities = graph_repository.chunk_entities
-            self.entity_degrees = graph_repository.entity_degrees
-
-    return _Index(artifacts.chunks, artifacts.embeddings)
+    return bootstrap_retriever(config)

@@ -17,13 +17,16 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from src.config import AppConfig, RetrievalConfig
 from src.domain.entities.retrieval_result import RetrievalResult
-from src.retriever import Retriever
+
+if TYPE_CHECKING:
+    from src.retriever import Retriever
 
 logger = logging.getLogger(__name__)
 
@@ -96,22 +99,26 @@ def _chunk_ids_for_article(
 
 def evaluate_retrieval(
     questions: list[dict[str, Any]],
-    retriever: Retriever,
+    *,
+    chunks: list[dict[str, Any]],
+    retrieve_by_vector: Callable[[np.ndarray], list[RetrievalResult]],
     method_name: str,
     ks: tuple[int, ...] = DEFAULT_KS,
     query_vectors: np.ndarray | None = None,
+    embed_queries: Callable[[list[str]], np.ndarray] | None = None,
 ) -> tuple[RetrievalMetrics, list[PerQuestionResult]]:
-    """Evaluate one retriever configuration over the question set.
+    """Evaluate one retrieval configuration over the question set.
 
     Args:
         questions: PubMedQA evaluation records with ``question`` and
             ``matched_article_id`` keys.
-        retriever: Configured ``Retriever`` instance.
+        chunks: Semantic chunk records used to derive gold chunk IDs.
+        retrieve_by_vector: Callable that runs retrieval for a pre-computed vector.
         method_name: Label for this run (e.g. ``vector_only`` or ``graph_rag``).
         ks: Cut-off values for recall.
         query_vectors: Optional pre-computed query embedding matrix of shape
-            ``(len(questions), embedding_dim)``. If provided, model loading is
-            skipped entirely.
+            ``(len(questions), embedding_dim)``.
+        embed_queries: Required when ``query_vectors`` is omitted; embeds question text.
 
     Returns:
         ``(aggregated_metrics, per_question_results)``.
@@ -119,15 +126,15 @@ def evaluate_retrieval(
     if not questions:
         raise ValueError("No evaluation questions provided.")
 
-    chunks = retriever.index.chunks
     per_question: list[PerQuestionResult] = []
     recall_values: dict[int, list[float]] = {k: [] for k in ks}
     rr_values: list[float] = []
 
     if query_vectors is None:
-        # Batch-embed all questions once to amortize model loading cost.
+        if embed_queries is None:
+            raise ValueError("embed_queries is required when query_vectors is not provided")
         query_texts = [str(q["question"]) for q in questions]
-        query_vectors = retriever.embed_queries(query_texts)
+        query_vectors = embed_queries(query_texts)
     elif query_vectors.shape[0] != len(questions):
         raise ValueError(
             f"query_vectors rows ({query_vectors.shape[0]}) != question count ({len(questions)})"
@@ -147,9 +154,7 @@ def evaluate_retrieval(
             )
             continue
 
-        results: list[RetrievalResult] = retriever.retrieve_by_vector(
-            query_vector, query_text=question
-        )
+        results: list[RetrievalResult] = retrieve_by_vector(query_vector)
         retrieved_ids = [r.chunk_id for r in results]
 
         recalls = {k: recall_at_k(retrieved_ids, gold_chunks, k) for k in ks}
@@ -180,6 +185,33 @@ def evaluate_retrieval(
         num_questions=len(per_question),
     )
     return metrics, per_question
+
+
+def evaluate_retrieval_with_retriever(
+    questions: list[dict[str, Any]],
+    retriever: "Retriever",
+    method_name: str,
+    ks: tuple[int, ...] = DEFAULT_KS,
+    query_vectors: np.ndarray | None = None,
+) -> tuple[RetrievalMetrics, list[PerQuestionResult]]:
+    """Deprecated wrapper: evaluate using a legacy ``Retriever`` adapter."""
+    import warnings
+
+    warnings.warn(
+        "evaluate_retrieval_with_retriever() is deprecated; pass chunks and "
+        "retrieve_by_vector to evaluate_retrieval() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return evaluate_retrieval(
+        questions,
+        chunks=retriever.index.chunks,
+        retrieve_by_vector=lambda query_vector: retriever.retrieve_by_vector(query_vector),
+        method_name=method_name,
+        ks=ks,
+        query_vectors=query_vectors,
+        embed_queries=retriever.embed_queries,
+    )
 
 
 def build_vector_only_config(base_config: AppConfig | None = None) -> AppConfig:
@@ -398,7 +430,8 @@ def main() -> int:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    from src.retriever import create_retriever
+    from src.bootstrap import bootstrap_retriever
+    from src.retriever import Retriever
 
     questions = load_questions(args.questions)
     if args.max_questions:
@@ -410,20 +443,27 @@ def main() -> int:
         if args.max_questions and query_vectors.shape[0] > len(questions):
             query_vectors = query_vectors[: len(questions)]
 
-    # GraphRAG run
     graph_config = AppConfig.default()
-    graph_retriever = create_retriever(graph_config)
+    graph_retriever = bootstrap_retriever(graph_config)
+    chunks = graph_retriever.index.chunks
+
     graph_metrics, graph_results = evaluate_retrieval(
-        questions, graph_retriever, method_name="graph_rag", query_vectors=query_vectors
+        questions,
+        chunks=chunks,
+        retrieve_by_vector=lambda query_vector: graph_retriever.retrieve_by_vector(query_vector),
+        method_name="graph_rag",
+        query_vectors=query_vectors,
     )
     logger.info("GraphRAG metrics: %s", graph_metrics)
 
-    # Vector-only run
     vector_config = build_vector_only_config(graph_config)
-    # Reuse the already-loaded index for speed.
     vector_retriever = Retriever(graph_retriever.index, vector_config)
     vector_metrics, vector_results = evaluate_retrieval(
-        questions, vector_retriever, method_name="vector_only", query_vectors=query_vectors
+        questions,
+        chunks=chunks,
+        retrieve_by_vector=lambda query_vector: vector_retriever.retrieve_by_vector(query_vector),
+        method_name="vector_only",
+        query_vectors=query_vectors,
     )
     logger.info("Vector-only metrics: %s", vector_metrics)
 

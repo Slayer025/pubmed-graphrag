@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from src.bootstrap import bootstrap_pipeline
+from src.bootstrap import bootstrap_pipeline, bootstrap_retriever
 from src.config import AppConfig
 from src.evaluation import (
     build_vector_only_config,
@@ -42,7 +42,7 @@ from src.evaluation import (
 from src.generation_eval import evaluate_generation, write_generation_csv
 from src.llm_client import create_llm_client
 from src.rag_pipeline import RAGPipeline
-from src.retriever import Retriever, create_retriever
+from src.retriever import Retriever
 
 logger = logging.getLogger(__name__)
 
@@ -272,37 +272,33 @@ def main() -> int:
     if args.max_questions and query_vectors.shape[0] > len(questions):
         query_vectors = query_vectors[: len(questions)]
 
-    # Initialize retriever (deprecated but kept for backward compatibility).
-    graph_config = base_config
-    graph_retriever = create_retriever(graph_config)
-    vector_config = build_vector_only_config(graph_config)
+    graph_retriever = bootstrap_retriever(base_config)
+    chunks = graph_retriever.index.chunks
+    chunk_by_id = graph_retriever.index.chunk_by_id
+    vector_config = build_vector_only_config(base_config)
     vector_retriever = Retriever(graph_retriever.index, vector_config)
 
-    # Run retrieval evaluation.
     graph_metrics, graph_per_question = evaluate_retrieval(
         questions,
-        graph_retriever,
+        chunks=chunks,
+        retrieve_by_vector=lambda query_vector: graph_retriever.retrieve_by_vector(query_vector),
         method_name="graph_rag",
         query_vectors=query_vectors,
     )
     vector_metrics, vector_per_question = evaluate_retrieval(
         questions,
-        vector_retriever,
+        chunks=chunks,
+        retrieve_by_vector=lambda query_vector: vector_retriever.retrieve_by_vector(query_vector),
         method_name="vector_only",
         query_vectors=query_vectors,
     )
 
-    # Attach gold chunks and raw RetrievalResult lists for generation/output.
-    chunks = graph_retriever.index.chunks
     for per_q in (vector_per_question, graph_per_question):
         for r in per_q:
             r.gold_chunks = _gold_chunks_for_article(r.matched_article_id, chunks)
             r.results = [
                 res
-                for res in (
-                    graph_retriever.index.chunk_by_id.get(cid)
-                    for cid in r.retrieved_chunks
-                )
+                for res in (chunk_by_id.get(cid) for cid in r.retrieved_chunks)
                 if res is not None
             ]
 
@@ -333,7 +329,7 @@ def main() -> int:
         questions,
         pipeline,
         graph_per_question,
-        graph_retriever.index.chunk_by_id,
+        chunk_by_id,
     )
 
     gen_metrics, gen_per_question = evaluate_generation(
