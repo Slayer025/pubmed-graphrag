@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_TIMEOUT_SECONDS = 30
-DEFAULT_HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction"
+DEFAULT_HF_API_URL = "https://api-inference.huggingface.co/models"
 
 
 class EmbeddingClientResult:
@@ -162,6 +162,7 @@ class RemoteEmbeddingClient:
         if self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
+        logger.info("Calling HuggingFace Inference API: %s", url)
         with httpx.Client(timeout=self._timeout_seconds) as client:
             response = client.post(
                 url,
@@ -178,6 +179,7 @@ class RemoteEmbeddingClient:
     def _remote_http_embed(self, texts: list[str]) -> list[list[float]]:
         """Call a custom HTTP embedding service."""
         assert self._service_url is not None
+        logger.info("Calling remote HTTP embedding service: %s", self._service_url)
         with httpx.Client(timeout=self._timeout_seconds) as client:
             response = client.post(
                 self._service_url,
