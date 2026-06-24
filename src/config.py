@@ -103,6 +103,10 @@ class RetrievalConfig:
     # Phase 3: query understanding routing
     enable_query_routing: bool = False
 
+    # Phase 4: metadata-aware boosting
+    enable_metadata_boost: bool = False
+    metadata_boost_factor: float = 1.1
+
     # Final result cap
     max_results: int = 20
 

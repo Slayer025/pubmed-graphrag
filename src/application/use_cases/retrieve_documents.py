@@ -16,6 +16,7 @@ from src.application.ports import (
     VectorStore,
 )
 from src.application.use_cases.graph_expand import GraphExpandUseCase
+from src.application.use_cases.metadata_boost import MetadataBoostService
 from src.application.use_cases.rerank import RerankUseCase
 from src.application.use_cases.vector_search import VectorSearchUseCase
 from src.domain.entities.retrieval_result import RetrievalResult
@@ -54,6 +55,7 @@ class RetrieveDocumentsUseCase:
         rrf_fusion_service: RRFFusionService | None = None,
         query_classifier: QueryClassifier | None = None,
         strategy_router: StrategyRouter | None = None,
+        metadata_boost_service: MetadataBoostService | None = None,
     ) -> None:
         self.vector_search = VectorSearchUseCase(embedding_service, vector_store)
         self.graph_expand = GraphExpandUseCase(graph_repository)
@@ -62,6 +64,33 @@ class RetrieveDocumentsUseCase:
         self.rrf_fusion_service = rrf_fusion_service or RRFFusionService()
         self.query_classifier = query_classifier
         self.strategy_router = strategy_router
+        self.metadata_boost_service = metadata_boost_service
+
+    def _apply_metadata_boost(
+        self,
+        results: list[RetrievalResult],
+        query: Query,
+        config: SearchConfig,
+    ) -> list[RetrievalResult]:
+        """Apply optional metadata-aware boosting and re-sort by combined_score."""
+        if not config.enable_metadata_boost:
+            return results
+        if self.metadata_boost_service is None:
+            logger.warning("Metadata boost enabled but no MetadataBoostService provided")
+            return results
+
+        boosted = self.metadata_boost_service.apply_boost(
+            results,
+            query.text,
+            config.metadata_boost_factor,
+        )
+        logger.info(
+            "METADATA BOOST APPLIED: factor=%.2f, top_chunk=%s, top_score=%.4f",
+            config.metadata_boost_factor,
+            boosted[0].chunk_id if boosted else "none",
+            boosted[0].combined_score if boosted else 0.0,
+        )
+        return sorted(boosted, key=lambda r: r.combined_score, reverse=True)
 
     def _apply_strategy(
         self,
@@ -145,6 +174,8 @@ class RetrieveDocumentsUseCase:
             seed_ids = {chunk_id for chunk_id, _ in fused_results}
             expanded = self.graph_expand.execute(seed_ids, routed_config)
             results = self.rerank.execute(fused_results, expanded, routed_config)
+
+        results = self._apply_metadata_boost(results, query, config)
 
         if config.enable_query_routing:
             return results, classification, strategy

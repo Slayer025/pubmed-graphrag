@@ -27,6 +27,8 @@ class SearchConfig:
     rrf_k: int = 20
     max_results: int = 20
     enable_query_routing: bool = False
+    enable_metadata_boost: bool = False
+    metadata_boost_factor: float = 1.1
 
     @classmethod
     def from_retrieval_config(cls, config) -> "SearchConfig":
@@ -43,6 +45,8 @@ class SearchConfig:
             use_hybrid=getattr(config, "use_hybrid", False),
             rrf_k=getattr(config, "rrf_k", 60),
             enable_query_routing=getattr(config, "enable_query_routing", False),
+            enable_metadata_boost=getattr(config, "enable_metadata_boost", False),
+            metadata_boost_factor=getattr(config, "metadata_boost_factor", 1.1),
         )
 
     def to_hyperparameters(self) -> RetrievalHyperparameters:

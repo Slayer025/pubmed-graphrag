@@ -88,6 +88,7 @@ class Retriever:
                 artifacts.mentions,
                 artifacts.has_chunk,
                 artifacts.chunks,
+                artifacts.entities,
             )
             chunk_repository = InMemoryChunkRepository(artifacts.chunks)
             self._retrieve_documents = RetrieveDocumentsUseCase(

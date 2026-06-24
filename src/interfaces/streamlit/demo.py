@@ -100,6 +100,13 @@ def _build_search_config(base: SearchConfig, overrides: dict[str, Any]) -> Searc
         alpha=overrides.get("alpha", base.alpha),
         depth_scores=base.depth_scores,
         max_results=overrides.get("max_results", base.max_results),
+        use_hybrid=overrides.get("use_hybrid", base.use_hybrid),
+        rrf_k=overrides.get("rrf_k", base.rrf_k),
+        enable_query_routing=overrides.get("enable_query_routing", base.enable_query_routing),
+        enable_metadata_boost=overrides.get("enable_metadata_boost", base.enable_metadata_boost),
+        metadata_boost_factor=overrides.get(
+            "metadata_boost_factor", base.metadata_boost_factor
+        ),
     )
 
 
@@ -417,12 +424,29 @@ def main() -> int:
     with st.sidebar:
         _render_embedding_diagnostics(HF_HOME)
 
-        st.header("Phase 3")
-        enable_query_routing = st.checkbox(
-            "Enable Query Understanding & Routing",
-            value=False,
-            help="When enabled, the query is classified and a retrieval strategy is selected automatically.",
-        )
+        with st.expander("🔍 Retrieval Strategy", expanded=True):
+            use_hybrid = st.checkbox(
+                "Enable Hybrid Retrieval",
+                value=False,
+                help="Combines dense vector search with BM25 keyword matching using Reciprocal Rank Fusion.",
+            )
+            enable_metadata_boost = st.checkbox(
+                "Enable Metadata-Aware Boosting",
+                value=False,
+                help="Boosts chunks containing relevant biomedical entities (genes, diseases, etc.).",
+            )
+            enable_query_routing = st.checkbox(
+                "Enable Query Understanding & Routing",
+                value=False,
+                help="Automatically selects retrieval strategy based on query type.",
+            )
+
+        with st.expander("⚙️ Retrieval Parameters", expanded=False):
+            top_k = st.slider("top_k", 1, 50, 10)
+            expand_depth = st.slider("expand_depth", 0, 3, 2)
+            max_entity_degree = st.slider("max_entity_degree", 10, 2000, 500)
+            alpha = st.slider("alpha (vector weight)", 0.0, 1.0, 0.8, step=0.05)
+            max_results = st.slider("max_results", 1, 50, 20)
 
         st.header("Model")
         llm_client_type, llm_selection = _render_llm_mode_sidebar()
@@ -433,29 +457,17 @@ def main() -> int:
             )
             st.session_state.llm_startup_logged = True
 
-        st.header("Retrieval")
-        top_k = st.slider("top_k", 1, 50, 10)
-        expand_depth = st.slider("expand_depth", 0, 3, 2)
-        max_entity_degree = st.slider("max_entity_degree", 10, 2000, 500)
-        alpha = st.slider("alpha (vector weight)", 0.0, 1.0, 0.8, step=0.05)
-        max_results = st.slider("max_results", 1, 50, 20)
-        use_hybrid = st.checkbox(
-            "Enable Hybrid Retrieval (Dense + BM25 + RRF)",
-            value=False,
-            help="When enabled, dense vector search and BM25 keyword search are fused with Reciprocal Rank Fusion.",
-        )
-
-        st.header("Phase 5 options")
-        use_decomposer = st.checkbox("Enable query decomposition", value=False)
-        use_reranker = st.checkbox("Enable graph re-ranking", value=False)
-        reranker_beta = st.slider(
-            "reranker beta (original score weight)",
-            0.0,
-            1.0,
-            0.7,
-            step=0.05,
-            disabled=not use_reranker,
-        )
+        with st.expander("🔬 Advanced Options", expanded=False):
+            use_decomposer = st.checkbox("Enable query decomposition", value=False)
+            use_reranker = st.checkbox("Enable graph re-ranking", value=False)
+            reranker_beta = st.slider(
+                "reranker beta (original score weight)",
+                0.0,
+                1.0,
+                0.7,
+                step=0.05,
+                disabled=not use_reranker,
+            )
 
     retrieval_overrides = {
         "top_k": top_k,
@@ -465,6 +477,7 @@ def main() -> int:
         "max_results": max_results,
         "use_hybrid": use_hybrid,
         "enable_query_routing": enable_query_routing,
+        "enable_metadata_boost": enable_metadata_boost,
     }
 
     try:
@@ -505,6 +518,8 @@ def main() -> int:
         _render_query_understanding(classification, strategy)
 
         st.subheader(f"Retrieved context ({len(results)} chunks)")
+        if search_config.enable_metadata_boost:
+            st.caption("🔬 Metadata boost applied")
         for rank, result in enumerate(results, start=1):
             _render_result_card(rank, result)
 

@@ -17,6 +17,7 @@ from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
 from src.application.ports import EmbeddingService, LLMClient
 from src.application.use_cases.generate_answer import GenerateAnswerUseCase
+from src.application.use_cases.metadata_boost import MetadataBoostService
 from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
 from src.config import AppConfig
 from src.graph_reranker import GraphReranker
@@ -94,9 +95,11 @@ def _build_retrieve_documents(config: AppConfig | None = None) -> RetrieveDocume
         artifacts.mentions,
         artifacts.has_chunk,
         artifacts.chunks,
+        artifacts.entities,
     )
     chunk_repository = InMemoryChunkRepository(artifacts.chunks)
     sparse_retriever = _build_sparse_retriever(artifacts.chunks)
+    metadata_boost_service = MetadataBoostService(graph_repository)
 
     return RetrieveDocumentsUseCase(
         embedding_service=embedding_service,
@@ -107,6 +110,7 @@ def _build_retrieve_documents(config: AppConfig | None = None) -> RetrieveDocume
         rrf_fusion_service=RRFFusionService(),
         query_classifier=_QueryClassifierPort(),
         strategy_router=_StrategyRouterPort(),
+        metadata_boost_service=metadata_boost_service,
     )
 
 
@@ -141,6 +145,7 @@ def build_pipeline(
             artifacts.mentions,
             artifacts.has_chunk,
             artifacts.chunks,
+            artifacts.entities,
         )
         chunk_repository = InMemoryChunkRepository(artifacts.chunks)
         sparse_retriever = _build_sparse_retriever(artifacts.chunks)
@@ -153,6 +158,7 @@ def build_pipeline(
             rrf_fusion_service=RRFFusionService(),
             query_classifier=_QueryClassifierPort(),
             strategy_router=_StrategyRouterPort(),
+            metadata_boost_service=MetadataBoostService(graph_repository),
         )
         return RAGPipeline(
             retrieve_documents=retrieve_documents,
@@ -177,6 +183,7 @@ def bootstrap_retriever(config: AppConfig | None = None) -> "Retriever":
         artifacts.mentions,
         artifacts.has_chunk,
         artifacts.chunks,
+        artifacts.entities,
     )
     chunk_repository = InMemoryChunkRepository(artifacts.chunks)
 

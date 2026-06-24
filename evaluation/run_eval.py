@@ -45,6 +45,7 @@ QUERIES_PATH = Path(__file__).parent / "queries.jsonl"
 DENSE_RESULTS_PATH = Path(__file__).parent / "results_dense_only.jsonl"
 HYBRID_RESULTS_PATH = Path(__file__).parent / "results_hybrid.jsonl"
 ROUTED_RESULTS_PATH = Path(__file__).parent / "results_routed.jsonl"
+METADATA_BOOST_RESULTS_PATH = Path(__file__).parent / "results_metadata_boost.jsonl"
 SUMMARY_PATH = Path(__file__).parent.parent / "outputs" / "retrieval_improvement_summary.json"
 
 
@@ -171,6 +172,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Phase 3 query understanding routing during evaluation.",
     )
+    parser.add_argument(
+        "--metadata-boost",
+        action="store_true",
+        help="Enable Phase 4 metadata-aware boosting during evaluation.",
+    )
+    parser.add_argument(
+        "--boost-factor",
+        type=float,
+        default=1.1,
+        help="Metadata boost factor (default: 1.1).",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +191,8 @@ def _build_search_config(
     use_hybrid: bool,
     rrf_k: int = 60,
     enable_query_routing: bool = False,
+    enable_metadata_boost: bool = False,
+    metadata_boost_factor: float = 1.1,
 ) -> SearchConfig:
     """Return the evaluation SearchConfig."""
     return SearchConfig(
@@ -193,6 +207,8 @@ def _build_search_config(
         use_hybrid=use_hybrid,
         rrf_k=rrf_k,
         enable_query_routing=enable_query_routing,
+        enable_metadata_boost=enable_metadata_boost,
+        metadata_boost_factor=metadata_boost_factor,
     )
 
 
@@ -201,9 +217,14 @@ def _run_evaluation(
     *,
     rrf_k: int = 60,
     enable_query_routing: bool = False,
+    enable_metadata_boost: bool = False,
+    metadata_boost_factor: float = 1.1,
 ) -> tuple[Path, dict, list[dict]]:
     """Run one evaluation pass and return the output path, metrics, and details."""
-    if enable_query_routing:
+    if enable_metadata_boost:
+        mode_label = "metadata_boost"
+        results_path = METADATA_BOOST_RESULTS_PATH
+    elif enable_query_routing:
         mode_label = "routed"
         results_path = ROUTED_RESULTS_PATH
     elif use_hybrid:
@@ -216,6 +237,8 @@ def _run_evaluation(
         use_hybrid=use_hybrid,
         rrf_k=rrf_k,
         enable_query_routing=enable_query_routing,
+        enable_metadata_boost=enable_metadata_boost,
+        metadata_boost_factor=metadata_boost_factor,
     )
 
     cache_dir = os.environ.get("ARTIFACT_CACHE_DIR", "").strip() or str(
@@ -250,7 +273,9 @@ def _run_evaluation(
         for record in detailed_results:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    if enable_query_routing:
+    if enable_metadata_boost:
+        display_label = f"Metadata boost hybrid (k={rrf_k}, boost={metadata_boost_factor})"
+    elif enable_query_routing:
         display_label = "Query routed hybrid"
     elif use_hybrid:
         display_label = f"Hybrid RRF (k={rrf_k})"
@@ -289,35 +314,63 @@ def _print_comparison_table(rows: list[tuple[str, dict]]) -> None:
     print("=" * 70, flush=True)
 
 
-def _compute_deltas(dense_metrics: dict, hybrid_metrics: dict) -> dict:
+def _compute_deltas(baseline_metrics: dict, comparison_metrics: dict) -> dict:
     """Return absolute and relative improvements for each metric."""
     keys = ["recall@5", "recall@10", "mrr@10", "avg_latency_ms"]
     deltas: dict[str, dict[str, float]] = {}
     for key in keys:
-        dense = dense_metrics[key]
-        hybrid = hybrid_metrics[key]
+        baseline = baseline_metrics[key]
+        comparison = comparison_metrics[key]
         deltas[key] = {
-            "dense": dense,
-            "hybrid": hybrid,
-            "absolute": round(hybrid - dense, 4),
-            "relative": round((hybrid - dense) / dense, 4) if dense else None,
+            "baseline": baseline,
+            "comparison": comparison,
+            "absolute": round(comparison - baseline, 4),
+            "relative": round((comparison - baseline) / baseline, 4) if baseline else None,
         }
     return deltas
 
 
-def _save_summary(dense_metrics: dict, hybrid_metrics: dict) -> None:
+def _load_summary() -> dict:
+    """Load the existing summary JSON or return an empty scaffold."""
+    if not SUMMARY_PATH.exists():
+        return {"metrics": {}, "deltas": {}}
+    with open(SUMMARY_PATH, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _save_summary(summary: dict) -> None:
     """Save the comparison summary to disk."""
-    summary = {
-        "metrics": {
-            "dense_only": dense_metrics,
-            "hybrid_rrf": hybrid_metrics,
-        },
-        "deltas": _compute_deltas(dense_metrics, hybrid_metrics),
-    }
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(SUMMARY_PATH, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
     print(f"\nSummary saved to {SUMMARY_PATH}", flush=True)
+
+
+def _compare_all_modes() -> dict:
+    """Load all existing result files, print comparison, and return metrics map."""
+    metrics: dict[str, dict] = {}
+    if DENSE_RESULTS_PATH.exists():
+        metrics["dense_only"] = _load_existing_metrics(DENSE_RESULTS_PATH)
+    if HYBRID_RESULTS_PATH.exists():
+        metrics["hybrid_rrf"] = _load_existing_metrics(HYBRID_RESULTS_PATH)
+    if ROUTED_RESULTS_PATH.exists():
+        metrics["query_routed_hybrid"] = _load_existing_metrics(ROUTED_RESULTS_PATH)
+    if METADATA_BOOST_RESULTS_PATH.exists():
+        metrics["metadata_boost_hybrid"] = _load_existing_metrics(METADATA_BOOST_RESULTS_PATH)
+
+    label_map = {
+        "dense_only": "Dense-only",
+        "hybrid_rrf": "Hybrid RRF",
+        "query_routed_hybrid": "Query routed hybrid",
+        "metadata_boost_hybrid": "Metadata boost hybrid",
+    }
+    rows = [
+        (label_map[key], metrics[key])
+        for key in ["dense_only", "hybrid_rrf", "query_routed_hybrid", "metadata_boost_hybrid"]
+        if key in metrics
+    ]
+    _print_comparison_table(rows)
+    return metrics
 
 
 def _load_existing_metrics(path: Path) -> dict:
@@ -339,7 +392,11 @@ def _compare_existing() -> int:
     dense_metrics = _load_existing_metrics(DENSE_RESULTS_PATH)
     hybrid_metrics = _load_existing_metrics(HYBRID_RESULTS_PATH)
     _print_comparison_table([("Dense-only", dense_metrics), ("Hybrid RRF", hybrid_metrics)])
-    _save_summary(dense_metrics, hybrid_metrics)
+    summary = _load_summary()
+    summary["metrics"]["dense_only"] = dense_metrics
+    summary["metrics"]["hybrid_rrf"] = hybrid_metrics
+    summary["deltas"]["dense_vs_hybrid_rrf"] = _compute_deltas(dense_metrics, hybrid_metrics)
+    _save_summary(summary)
     return 0
 
 
@@ -356,19 +413,12 @@ def _run_tuning() -> int:
         rows.append((f"Hybrid RRF (k={k})", hybrid_metrics_by_k[k]))
     _print_comparison_table(rows)
 
-    summary = {
-        "metrics": {
-            "dense_only": dense_metrics,
-            **{f"hybrid_rrf_k{k}": hybrid_metrics_by_k[k] for k in (20, 30, 60)},
-        },
-        "deltas": {
-            f"k{k}": _compute_deltas(dense_metrics, hybrid_metrics_by_k[k])
-            for k in (20, 30, 60)
-        },
-    }
-    SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(SUMMARY_PATH, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, ensure_ascii=False)
+    summary = _load_summary()
+    summary["metrics"]["dense_only"] = dense_metrics
+    for k in (20, 30, 60):
+        summary["metrics"][f"hybrid_rrf_k{k}"] = hybrid_metrics_by_k[k]
+        summary["deltas"][f"k{k}"] = _compute_deltas(dense_metrics, hybrid_metrics_by_k[k])
+    _save_summary(summary)
     print(f"\nTuning summary saved to {SUMMARY_PATH}", flush=True)
     return 0
 
@@ -383,8 +433,43 @@ def main() -> int:
     if args.compare:
         return _compare_existing()
 
+    if args.metadata_boost:
+        _, metadata_boost_metrics, _ = _run_evaluation(
+            use_hybrid=True,
+            rrf_k=20,
+            enable_metadata_boost=True,
+            metadata_boost_factor=args.boost_factor,
+        )
+        all_metrics = _compare_all_modes()
+        summary = _load_summary()
+        summary["metrics"]["metadata_boost_hybrid"] = metadata_boost_metrics
+        # Previous best mode is query_routed_hybrid; fall back to hybrid_rrf if unavailable.
+        baseline_key = (
+            "query_routed_hybrid"
+            if "query_routed_hybrid" in all_metrics
+            else "hybrid_rrf"
+        )
+        baseline_metrics = all_metrics[baseline_key]
+        summary["deltas"]["metadata_boost_vs_routed_hybrid"] = _compute_deltas(
+            baseline_metrics, metadata_boost_metrics
+        )
+        _save_summary(summary)
+        return 0
+
     if args.routed:
-        _run_evaluation(use_hybrid=True, rrf_k=20, enable_query_routing=True)
+        _, routed_metrics, _ = _run_evaluation(use_hybrid=True, rrf_k=20, enable_query_routing=True)
+        all_metrics = _compare_all_modes()
+        summary = _load_summary()
+        summary["metrics"]["query_routed_hybrid"] = routed_metrics
+        if "dense_only" in all_metrics:
+            summary["deltas"]["routed_vs_dense"] = _compute_deltas(
+                all_metrics["dense_only"], routed_metrics
+            )
+        if "hybrid_rrf" in all_metrics:
+            summary["deltas"]["routed_vs_hybrid_rrf_k20"] = _compute_deltas(
+                all_metrics["hybrid_rrf"], routed_metrics
+            )
+        _save_summary(summary)
         return 0
 
     if args.hybrid:

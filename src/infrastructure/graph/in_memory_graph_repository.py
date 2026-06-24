@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryGraphRepository:
@@ -13,6 +16,7 @@ class InMemoryGraphRepository:
         mentions: list[dict[str, str]],
         has_chunk: list[dict[str, str]],
         chunks: list[dict[str, Any]],
+        entities: list[dict[str, str]] | None = None,
     ) -> None:
         self.chunk_article: dict[str, str] = {}
         self.article_chunks: dict[str, set[str]] = {}
@@ -31,11 +35,29 @@ class InMemoryGraphRepository:
             self.article_chunks.setdefault(article_id, set()).add(chunk_id)
             self.chunk_article[chunk_id] = article_id
 
+        entity_labels: dict[str, str] = {}
+        if entities:
+            for entity in entities:
+                entity_id = str(entity.get("entity_id", ""))
+                label = str(entity.get("label", "")).strip()
+                if entity_id and label:
+                    entity_labels[entity_id] = label
+
+        skipped_mentions = 0
         for rel in mentions:
             entity_id = str(rel["entity_id"])
             chunk_id = str(rel["chunk_id"])
+            if entity_labels.get(entity_id) == "000":
+                skipped_mentions += 1
+                continue
             self.entity_chunks.setdefault(entity_id, set()).add(chunk_id)
             self.chunk_entities.setdefault(chunk_id, set()).add(entity_id)
+
+        if skipped_mentions:
+            logger.warning(
+                "Filtered %d mentions for entities with artifact label '000'",
+                skipped_mentions,
+            )
 
         self.entity_degrees: dict[str, int] = {
             entity_id: len(chunks) for entity_id, chunks in self.entity_chunks.items()
