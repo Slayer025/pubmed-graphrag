@@ -36,12 +36,34 @@ class Neo4jConfig:
 
 @dataclass(frozen=True)
 class EmbeddingConfig:
-    """Embedding model and artifact settings."""
+    """Embedding model, provider, and artifact settings."""
 
+    provider: str = "local"
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dim: int = 384
     batch_size: int = 64
     normalize: bool = True
+    api_token: str | None = None
+    service_url: str | None = None
+    timeout_seconds: float = 30.0
+
+    @classmethod
+    def from_env(cls) -> "EmbeddingConfig":
+        """Build embedding config from environment / Streamlit secrets."""
+        defaults = cls()
+        return cls(
+            provider=os.environ.get("EMBEDDING_PROVIDER", defaults.provider),
+            model_name=os.environ.get("EMBEDDING_MODEL", defaults.model_name),
+            embedding_dim=int(os.environ.get("EMBEDDING_DIM", defaults.embedding_dim)),
+            batch_size=int(os.environ.get("EMBEDDING_BATCH_SIZE", defaults.batch_size)),
+            normalize=os.environ.get("EMBEDDING_NORMALIZE", "true").lower()
+            in {"1", "true", "yes"},
+            api_token=os.environ.get("HF_API_TOKEN"),
+            service_url=os.environ.get("EMBEDDING_SERVICE_URL"),
+            timeout_seconds=float(
+                os.environ.get("EMBEDDING_TIMEOUT_SECONDS", defaults.timeout_seconds)
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -108,7 +130,7 @@ class AppConfig:
     def default(cls) -> "AppConfig":
         return cls(
             neo4j=Neo4jConfig.from_env(),
-            embedding=EmbeddingConfig(),
+            embedding=EmbeddingConfig.from_env(),
             artifact=ArtifactConfig(),
             retrieval=RetrievalConfig(),
             rerank=RerankConfig(),

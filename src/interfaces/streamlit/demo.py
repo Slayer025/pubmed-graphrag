@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ from src.application.use_cases.generate_answer import GenerateAnswerUseCase
 from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
 from src.bootstrap import build_pipeline, default_search_config
 from src.bootstrap.bootstrap_artifacts import get_preloaded_artifacts
+from src.config import AppConfig
+from src.infrastructure.embeddings.remote_embedding_client import create_embedding_client
 from src.domain.entities.retrieval_result import RetrievalResult
 from src.domain.value_objects.query import Query
 from src.graph_reranker import GraphReranker
@@ -232,6 +235,64 @@ def _active_llm_mode(selection: Any) -> str:
     return selection.mode
 
 
+@st.cache_data(show_spinner=False)
+def _probe_embedding_client(hf_home: str) -> dict[str, Any]:
+    """Probe the configured embedding provider and return runtime diagnostics."""
+    cfg = AppConfig.default().embedding
+    result = create_embedding_client(
+        provider=cfg.provider,
+        model_name=cfg.model_name,
+        api_token=cfg.api_token,
+        service_url=cfg.service_url,
+        batch_size=cfg.batch_size,
+        normalize=cfg.normalize,
+        timeout_seconds=cfg.timeout_seconds,
+        cache_folder=hf_home,
+    )
+    client = result.client
+    t0 = time.perf_counter()
+    try:
+        client.embed_query("diagnostic probe")
+        latency_ms = (time.perf_counter() - t0) * 1000
+        error = None
+    except Exception as exc:
+        latency_ms = (time.perf_counter() - t0) * 1000
+        error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "provider": client.provider,
+        "selected_provider": result.selected_provider,
+        "model_name": client.model_name,
+        "fallback_reason": client.fallback_reason,
+        "latency_ms": latency_ms,
+        "error": error,
+    }
+
+
+def _render_embedding_diagnostics(hf_home: str) -> None:
+    """Display embedding provider status in the sidebar."""
+    st.header("System Status")
+    with st.expander("Embedding provider diagnostics", expanded=True):
+        try:
+            diagnostics = _probe_embedding_client(hf_home)
+        except Exception as exc:
+            st.error(f"Could not probe embedding client: {exc}")
+            return
+
+        st.markdown(f"**Active provider:** `{diagnostics['provider']}`")
+        st.markdown(f"**Requested provider:** `{diagnostics['selected_provider']}`")
+        st.markdown(f"**Model:** `{diagnostics['model_name']}`")
+        st.markdown(f"**Probe latency:** `{diagnostics['latency_ms']:.1f} ms`")
+
+        if diagnostics["fallback_reason"]:
+            st.warning(f"Fallback: {diagnostics['fallback_reason']}")
+
+        if diagnostics["error"]:
+            st.error(f"Probe failed: {diagnostics['error']}")
+        elif diagnostics["provider"] != diagnostics["selected_provider"]:
+            st.info("The active provider differs from the requested provider due to fallback.")
+
+
 def _render_llm_mode_sidebar() -> tuple[str, Any]:
     """Render LLM controls and return selected type plus instantiated client."""
     llm_options = ["mock"]
@@ -314,6 +375,8 @@ def main() -> int:
         st.session_state.llm_startup_logged = False
 
     with st.sidebar:
+        _render_embedding_diagnostics(HF_HOME)
+
         st.header("Model")
         llm_client_type, llm_selection = _render_llm_mode_sidebar()
         if not st.session_state.llm_startup_logged:

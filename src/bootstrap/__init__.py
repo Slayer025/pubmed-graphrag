@@ -15,17 +15,13 @@ from typing import Any
 
 from src.application.dto.rerank_config import RerankConfig
 from src.application.dto.search_config import SearchConfig
-from src.application.ports import LLMClient
+from src.application.ports import EmbeddingService, LLMClient
 from src.application.use_cases.generate_answer import GenerateAnswerUseCase
 from src.application.use_cases.retrieve_documents import RetrieveDocumentsUseCase
 from src.config import AppConfig
-from src.embeddings import create_embedding_model
 from src.graph_reranker import GraphReranker
 from src.domain.services.rrf_fusion_service import RRFFusionService
-from src.infrastructure.embeddings.sentence_transformer_service import (
-    LazySentenceTransformerEmbeddingService,
-    SentenceTransformerEmbeddingService,
-)
+from src.infrastructure.embeddings.remote_embedding_client import create_embedding_client
 from src.infrastructure.graph.in_memory_graph_repository import InMemoryGraphRepository
 from src.infrastructure.retrievers.bm25_retriever import BM25Retriever
 from src.infrastructure.storage.artifact_loader import LoadedArtifacts
@@ -49,23 +45,21 @@ def _load_artifacts() -> LoadedArtifacts:
     return get_preloaded_artifacts()
 
 
-@lru_cache(maxsize=1)
-def _load_embedding_model() -> Any:
-    """Load the sentence-transformers model exactly once per process."""
-    cfg = AppConfig.default()
-    logger.info("Loading embedding model...")
-    return create_embedding_model(cfg.embedding.model_name)
-
-
-def _build_embedding_service(config: AppConfig | None = None) -> SentenceTransformerEmbeddingService:
-    """Build the embedding service adapter (lightweight wrapper around cached model)."""
+def _build_embedding_service(config: AppConfig | None = None) -> EmbeddingService:
+    """Build the embedding service adapter based on AppConfig."""
     cfg = config or AppConfig.default()
-    model = _load_embedding_model()
-    return SentenceTransformerEmbeddingService(
-        model=model,
+    result = create_embedding_client(
+        provider=cfg.embedding.provider,
+        model_name=cfg.embedding.model_name,
+        api_token=cfg.embedding.api_token,
+        service_url=cfg.embedding.service_url,
         batch_size=cfg.embedding.batch_size,
         normalize=cfg.embedding.normalize,
+        timeout_seconds=cfg.embedding.timeout_seconds,
     )
+    if result.fallback_reason:
+        logger.warning("Embedding client fallback: %s", result.fallback_reason)
+    return result.client
 
 
 def _build_sparse_retriever(chunks: list[dict[str, Any]]) -> BM25Retriever:
@@ -115,12 +109,16 @@ def build_pipeline(
     require_bootstrap_success()
     with pure_build_guard():
         app_config = AppConfig.default()
-        embedding_service = LazySentenceTransformerEmbeddingService(
+        embedding_service = create_embedding_client(
+            provider=app_config.embedding.provider,
             model_name=app_config.embedding.model_name,
-            hf_home=hf_home,
+            api_token=app_config.embedding.api_token,
+            service_url=app_config.embedding.service_url,
             batch_size=app_config.embedding.batch_size,
             normalize=app_config.embedding.normalize,
-        )
+            timeout_seconds=app_config.embedding.timeout_seconds,
+            cache_folder=hf_home,
+        ).client
         graph_repository = InMemoryGraphRepository(
             artifacts.mentions,
             artifacts.has_chunk,
