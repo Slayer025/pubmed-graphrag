@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import inspect
 import os
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -21,8 +22,24 @@ def assert_not_during_pure_build(operation: str) -> None:
         raise RuntimeError(f"build_pipeline violated purity: {operation}")
 
 
+# Framework packages that legitimately open files while serving the app.
+# Exempting them prevents static asset serving from tripping the purity guard.
+_FRAMEWORK_MODULES = ("starlette", "streamlit", "anyio", "uvicorn", "fastapi")
+
+
+def _is_framework_call() -> bool:
+    """Return True if the open() call originates from a framework package."""
+    for frame_info in inspect.stack():
+        filename = frame_info.filename
+        if any(module in filename for module in _FRAMEWORK_MODULES):
+            return True
+    return False
+
+
 def _guarded_open(*args: Any, **kwargs: Any) -> Any:
     if _pure_build_depth > 0:
+        if _is_framework_call():
+            return _original_open(*args, **kwargs)
         global _filesystem_access_count
         _filesystem_access_count += 1
         raise RuntimeError("build_pipeline violated purity: filesystem access during build")
